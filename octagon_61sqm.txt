@@ -1,0 +1,14 @@
+# Regular octagon coordinates (x y in meters)
+# Area ≈ 61.00 m^2
+# Regular octagon centered and shifted so all coords are positive
+# Format: x y  (one vertex per line, polygon will be closed automatically by the importer if needed)
+
+9.789830084 5.144915042
+8.428898956 8.428898956
+5.144915042 9.789830084
+1.860931128 8.428898956
+0.500000000 5.144915042
+1.860931128 1.860931128
+5.144915042 0.500000000
+8.428898956 1.860931128
+

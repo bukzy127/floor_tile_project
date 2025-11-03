@@ -1,0 +1,26 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+build/
+dist/
+*.egg-info/
+.vscode/
+.idea/
+*.DS_Store
+*.log
+*.sqlite3
+/.env
+/*.env
+# Editor backups
+*~
+# OS files
+Thumbs.db
+desktop.ini
+
+# If you create a credentials or key file, add it here
+# secret_key.txt
