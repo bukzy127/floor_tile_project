@@ -19,7 +19,7 @@ os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
 os.environ.setdefault("QT_OPENGL", "desktop")
 
 EPSILON = 1e-6                   # Small value for float comparisons
-
+PICK_EPSILON = 1e-5              # Tolerance used during mouse picking tests
 # -----------------------------------------------------------------------------
 # Helper: simple 2D polygon area
 def polygon_area_2d(poly):
@@ -29,8 +29,24 @@ def polygon_area_2d(poly):
     y = [p[1] for p in poly]
     return 0.5 * abs(sum(x[i] * y[i+1] - x[i+1] * y[i] for i in range(-1, len(poly)-1)))
 
-# -----------------------------------------------------------------------------
-def point_in_polygon(pt, poly):
+def point_on_segment_2d(pt, a, b, tolerance=0.0):
+    """Return True if pt lies within tolerance of the line segment AB."""
+    ax, ay = a
+    bx, by = b
+    px, py = pt
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+    ab_len_sq = abx * abx + aby * aby
+    if ab_len_sq < EPSILON:
+        return math.hypot(apx, apy) <= tolerance
+    t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab_len_sq))
+    closest_x = ax + t * abx
+    closest_y = ay + t * aby
+    return math.hypot(px - closest_x, py - closest_y) <= tolerance
+
+def point_in_polygon(pt, poly, tolerance=0.0):
     if not poly or len(poly) < 3:
         return False
     x, y = pt
@@ -41,6 +57,8 @@ def point_in_polygon(pt, poly):
     for i in range(n):
         xi, yi = poly[i]
         xj, yj = poly[j]
+        if tolerance > 0.0 and point_on_segment_2d((x, y), (xi, yi), (xj, yj), tolerance):
+            return True
         intersect = ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-18) + xi)
         if intersect:
             inside = not inside
@@ -98,6 +116,13 @@ class Tile3D:
         self.qr_data = qr_data
         self.corners_bottom_xyz = []
         self.corners_top_xyz = []
+      # Cached picking helpers (set by prepare_pick_geometry)
+        self.pick_origin = None
+        self.pick_normal = None
+        self.pick_u_axis = None
+        self.pick_v_axis = None
+        self.pick_polygon2d = []
+        self.pick_bounds = None
 
     def get_actual_xy_footprint(self):
         if self.cut_polygon_xy and len(self.cut_polygon_xy) >=3:
@@ -115,7 +140,70 @@ class Tile3D:
             z_top = z_bottom + self.thickness
             self.corners_bottom_xyz.append(QVector3D(x, y, z_bottom))
             self.corners_top_xyz.append(QVector3D(x, y, z_top))
+            self.prepare_pick_geometry()
 
+    def prepare_pick_geometry(self):
+        """Pre-compute an orthonormal basis used during mouse picking."""
+        self.pick_origin = None
+        self.pick_normal = None
+        self.pick_u_axis = None
+        self.pick_v_axis = None
+        self.pick_polygon2d = []
+        self.pick_bounds = None
+        if not self.corners_top_xyz or len(self.corners_top_xyz) < 3:
+            return
+        # Use the centroid of the polygon as the origin for better numerical stability.
+        centroid = QVector3D(0.0, 0.0, 0.0)
+        for p in self.corners_top_xyz:
+            centroid += p
+        centroid /= float(len(self.corners_top_xyz))
+        # Estimate plane normal from the polygon fan.
+        plane_normal = QVector3D(0.0, 0.0, 0.0)
+        for i in range(len(self.corners_top_xyz)):
+            p_curr = self.corners_top_xyz[i] - centroid
+            p_next = self.corners_top_xyz[(i + 1) % len(self.corners_top_xyz)] - centroid
+            plane_normal += QVector3D.crossProduct(p_curr, p_next)
+        if plane_normal.lengthSquared() < EPSILON:
+            return
+        plane_normal.normalize()
+        # Build a stable orthonormal basis on the plane using the longest edge.
+        longest_edge = None
+        longest_len_sq = -1.0
+        for i in range(len(self.corners_top_xyz)):
+            a = self.corners_top_xyz[i]
+            b = self.corners_top_xyz[(i + 1) % len(self.corners_top_xyz)]
+            edge = b - a
+            length_sq = edge.lengthSquared()
+            if length_sq > longest_len_sq and length_sq > EPSILON:
+                longest_len_sq = length_sq
+                longest_edge = edge
+        if longest_edge is None:
+            return
+        u_axis = longest_edge.normalized()
+        v_axis = QVector3D.crossProduct(plane_normal, u_axis)
+        if v_axis.lengthSquared() < EPSILON:
+            return
+        v_axis.normalize()
+        # Cache for picking.
+        self.pick_origin = centroid
+        self.pick_normal = plane_normal
+        self.pick_u_axis = u_axis
+        self.pick_v_axis = v_axis
+        # Pre-project the polygon into the orthonormal basis.
+        poly2d = []
+        min_u = min_v = float('inf')
+        max_u = max_v = float('-inf')
+        for p in self.corners_top_xyz:
+            rel = p - centroid
+            u = QVector3D.dotProduct(rel, u_axis)
+            v = QVector3D.dotProduct(rel, v_axis)
+            poly2d.append((u, v))
+            min_u = min(min_u, u)
+            max_u = max(max_u, u)
+            min_v = min(min_v, v)
+            max_v = max(max_v, v)
+        self.pick_polygon2d = poly2d
+        self.pick_bounds = (min_u, max_u, min_v, max_v)
 # -----------------------------------------------------------------------------
 class InfoDialog(QDialog):
     def __init__(self, tile: Tile3D, parent=None):
@@ -452,6 +540,25 @@ class GLWidget(QOpenGLWidget):
                     tile = Tile3D(origin_xy=(x_orig, y_orig), xtile=tile_params['width'], ytile=tile_params['length'], thickness=tile_params['thickness'], is_cut=is_cut, cut_polygon_xy=inter, qr_data=f"T-{i}-{j}")
                     tile.compute_3d_corners(actual_tile_bottom_z)
                     initial_tiles.append(tile)
+                
+      # Characterize tiles so we can reduce pedestals under very small edge pieces
+        full_tile_area = tile_params['width'] * tile_params['length']
+        small_piece_threshold = full_tile_area * 0.25 if full_tile_area > 0 else 0.0
+        edge_epsilon = 1e-4
+        tile_characteristics = []
+        for tile in initial_tiles:
+            footprint = tile.get_actual_xy_footprint()
+            area = abs(polygon_area_2d(footprint))
+            touches_bbox = any(
+                abs(px - origin_x) < edge_epsilon
+                or abs(px - (origin_x + rw_param)) < edge_epsilon
+                or abs(py - origin_y) < edge_epsilon
+                or abs(py - (origin_y + rl_param)) < edge_epsilon
+                for px, py in footprint
+            ) if footprint else False
+            is_small_edge_piece = bool(tile.is_cut and touches_bbox and area < small_piece_threshold)
+            tile_characteristics.append({'is_small_edge_piece': is_small_edge_piece, 'area': area})
+            tile.is_small_edge_piece = is_small_edge_piece
 
         # Generate and adjust pedestals (existing algorithm works with arbitrary corner coords)
         pedestal_cap_radius = 0.035
@@ -494,6 +601,9 @@ class GLWidget(QOpenGLWidget):
 
         for key, data in logical_pedestals.items():
             if data['type'] == 1 or data['type'] == 2:
+                tile_indexes = data.get('tiles', [])
+                if tile_indexes and all(tile_characteristics[t_idx]['is_small_edge_piece'] for t_idx in tile_indexes):
+                    continue
                 px, py = data['pos']
                 R = pedestal_cap_radius
                 adj_px, adj_py = px, py
@@ -560,7 +670,11 @@ class GLWidget(QOpenGLWidget):
         # 4. Filter tiles to keep only those that are fully supported: all corner points must have pedestals nearby
         supported_corners_keys = final_pedestals_map.keys()
         self.tiles = []
-        for tile in initial_tiles:
+         
+        for idx, tile in enumerate(initial_tiles):
+            if tile_characteristics[idx]['is_small_edge_piece']:
+                self.tiles.append(tile)
+                continue
             is_supported = all((round(cx, 4), round(cy, 4)) in supported_corners_keys for cx, cy in tile.get_actual_xy_footprint())
             if is_supported:
                 self.tiles.append(tile)
@@ -740,8 +854,11 @@ class GLWidget(QOpenGLWidget):
         if event.buttons() == QtCore.Qt.MouseButton.LeftButton:
             prev_idx = self.selected_tile_index
             self.selected_tile_index = -1
-            #tile_obj, tile_idx = self.pick_tile_accurate(event.x(), event.y())
-            tile_obj, tile_idx = self.pick_tile_accurate(event.position().x(), event.position().y())
+            pixel_ratio = self.devicePixelRatioF()
+            tile_obj, tile_idx = self.pick_tile_accurate(
+                event.position().x() * pixel_ratio,
+                event.position().y() * pixel_ratio,
+            )
             if tile_obj:
                 self.selected_tile_index = tile_idx
                 self.tileClicked.emit(tile_obj)
@@ -789,26 +906,48 @@ class GLWidget(QOpenGLWidget):
         # Use cached matrices captured during paintGL to avoid GL calls here
         if self._cached_modelview is None or self._cached_projection is None or self._cached_viewport is None:
             return None, -1
-        mvm = self._cached_modelview; pjm = self._cached_projection; vp = self._cached_viewport
-        nx,ny,nz = gluUnProject(x_screen,vp[3]-y_screen,0.0,mvm,pjm,vp)
-        fx,fy,fz = gluUnProject(x_screen,vp[3]-y_screen,1.0,mvm,pjm,vp)
-        ro=QVector3D(nx,ny,nz); rd=QVector3D(fx-nx,fy-ny,fz-nz).normalized()
-        ct,cti,md = None,-1,float('inf')
-        for i,t in enumerate(self.tiles):
-            if not t.corners_top_xyz: continue
-            p0,p1,p2 = t.corners_top_xyz[0],t.corners_top_xyz[1],t.corners_top_xyz[2]
-            plane_n=QVector3D.crossProduct(p1-p0,p2-p0).normalized()
-            denom=QVector3D.dotProduct(plane_n,rd)
-            if abs(denom)<EPSILON: continue
-            t_int=QVector3D.dotProduct(p0-ro,plane_n)/denom
-            if t_int<0 or t_int >= md: continue
-            ipt3d=ro+t_int*rd
-            u_vec=(p1-p0).normalized(); v_vec=QVector3D.crossProduct(plane_n,u_vec)
-            iu,iv = QVector3D.dotProduct(ipt3d-p0,u_vec), QVector3D.dotProduct(ipt3d-p0,v_vec)
-            poly2d=[(QVector3D.dotProduct(c-p0,u_vec),QVector3D.dotProduct(c-p0,v_vec)) for c in t.corners_top_xyz]
-            if point_in_polygon((iu,iv),poly2d):
-                md=t_int; ct=t; cti=i
-        return ct,cti
+        mvm = self._cached_modelview
+        pjm = self._cached_projection
+        vp = self._cached_viewport
+        # QOpenGLWidget renders into a framebuffer whose resolution can be
+        # larger than the logical widget size on high-DPI displays.  The
+        # incoming mouse position is in device-independent coordinates, so it
+        # needs to be converted to the framebuffer's pixel space before we
+        # hand it to gluUnProject (which expects raw viewport pixels).
+        # Guard against re-scaling positions that are already provided in
+        # framebuffer coordinates by clamping to the viewport bounds.
+        x_screen = max(vp[0], min(vp[0] + vp[2], x_screen))
+        y_screen = max(vp[1], min(vp[1] + vp[3], y_screen))
+        nx, ny, nz = gluUnProject(x_screen, vp[3] - y_screen, 0.0, mvm, pjm, vp)
+        fx, fy, fz = gluUnProject(x_screen, vp[3] - y_screen, 1.0, mvm, pjm, vp)
+        ro = QVector3D(nx, ny, nz)
+        rd = QVector3D(fx - nx, fy - ny, fz - nz).normalized()
+        closest_tile = None
+        closest_index = -1
+        min_t = float('inf')
+        for idx, tile in enumerate(self.tiles):
+            if tile.pick_origin is None or tile.pick_normal is None:
+                continue
+            denom = QVector3D.dotProduct(tile.pick_normal, rd)
+            if abs(denom) < EPSILON:
+                continue
+            t_int = QVector3D.dotProduct(tile.pick_origin - ro, tile.pick_normal) / denom
+            if t_int < -PICK_EPSILON or t_int >= min_t:
+                continue
+            ipt3d = ro + rd * t_int
+            rel = ipt3d - tile.pick_origin
+            u = QVector3D.dotProduct(rel, tile.pick_u_axis)
+            v = QVector3D.dotProduct(rel, tile.pick_v_axis)
+            if tile.pick_bounds is not None:
+                min_u, max_u, min_v, max_v = tile.pick_bounds
+                if (u < min_u - PICK_EPSILON or u > max_u + PICK_EPSILON or
+                        v < min_v - PICK_EPSILON or v > max_v + PICK_EPSILON):
+                    continue
+            if point_in_polygon((u, v), tile.pick_polygon2d, tolerance=PICK_EPSILON):
+                min_t = t_int
+                closest_tile = tile
+                closest_index = idx
+        return closest_tile, closest_index
 
     # --- START: New/Modified methods for Exporting ---
 

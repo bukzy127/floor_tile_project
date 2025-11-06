@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 # === Load points from the text file ===
-filename = "stepped_room_6x4.txt"
+filename = "room_irregular_surface.txt"
 points = []
 
 with open(filename) as f:
