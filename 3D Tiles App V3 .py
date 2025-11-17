@@ -16,6 +16,8 @@ from PyQt6.QtGui import QSurfaceFormat, QVector3D, QMatrix4x4, QQuaternion, QVec
 from OpenGL.GL import *
 from OpenGL.GLU import *
 import os, faulthandler
+import qrcode
+from PIL import Image
 faulthandler.enable()
 # Workaround for macOS Qt5 + QOpenGLWidget crashes
 os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
@@ -973,8 +975,57 @@ class GLWidget(QOpenGLWidget):
             for v in tile.corners_top_xyz: glVertex3f(v.x(), v.y(), v.z() + 0.0005)
             glEnd()
         glLineWidth(1.0)
-def build_qr_payload_for_tile(self, tile):
-        """Return a compact JSON payload describing the tile's QR metadata."""
+        # Attempt to draw a QR overlay for the tile (created lazily)
+        try:
+            self.draw_tile_qr(tile)
+        except Exception:
+            # Don't let QR generation break rendering
+            pass
+
+    def _generate_qr_pil_image(self, tile, px_size=256):
+        """Create a square RGBA PIL image containing the QR for `tile`."""
+        try:
+            payload = self.build_qr_payload_for_tile(tile)
+        except Exception:
+            payload = json.dumps({"id": tile.qr_data or ""}, separators=(',', ':'))
+
+        qr = qrcode.QRCode(box_size=8, border=2)
+        qr.add_data(payload)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
+        img = img.resize((px_size, px_size), resample=Image.NEAREST)
+        return img
+
+    def _upload_pil_image_as_texture(self, pil_img):
+        """Upload a PIL RGBA image to OpenGL and return the texture id."""
+        data = pil_img.tobytes("raw", "RGBA")
+        w, h = pil_img.size
+        tex_id = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, int(tex_id))
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+        return int(tex_id)
+
+    def _ensure_tile_qr_texture(self, tile):
+        """Create and attach a QR texture to `tile` if not already present.
+
+        This must be called while an OpenGL context is current (e.g. inside paintGL).
+        """
+        if getattr(tile, "qr_texture_id", None):
+            return
+        try:
+            img = self._generate_qr_pil_image(tile, px_size=256)
+            tex = self._upload_pil_image_as_texture(img)
+            tile.qr_texture_id = tex
+            # size in world units (meters) used when drawing the quad
+            tile.qr_size = min(tile.xtile, tile.ytile) * 0.5
+        except Exception:
+            tile.qr_texture_id = None
+            tile.qr_size = 0.0
         if tile is None:
             return json.dumps({}, sort_keys=True, separators=(',', ':'))
 
@@ -1009,6 +1060,13 @@ def build_qr_payload_for_tile(self, tile):
         """Draw the tile's QR texture and a thin white bounding frame."""
         if tile is None or not tile.corners_top_xyz:
             return
+
+        # Ensure the texture exists (lazy creation inside a current GL context)
+        if not getattr(tile, "qr_texture_id", None):
+            try:
+                self._ensure_tile_qr_texture(tile)
+            except Exception:
+                return
 
         texture_id = getattr(tile, "qr_texture_id", None)
         if not texture_id:
