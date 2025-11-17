@@ -142,6 +142,8 @@ class Tile3D:
         self.is_cut = is_cut
         self.cut_polygon_xy = cut_polygon_xy
         self.qr_data = qr_data
+        self.qr_texture_id = None
+        self.qr_size = None
         self.pedestal_list = []
         self.corners_bottom_xyz = []
         self.corners_top_xyz = []
@@ -400,6 +402,8 @@ class GLWidget(QOpenGLWidget):
         self.show_wireframe = False
         self.show_elevation_map = False
         self.show_tiles = True
+        self.show_qr_codes = True 
+
 
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
@@ -466,7 +470,10 @@ class GLWidget(QOpenGLWidget):
 
         for ped in self.pedestals: self.draw_pedestal(ped)
         if self.show_tiles:
-            for i, t in enumerate(self.tiles): self.draw_tile(t, is_selected=(i == self.selected_tile_index))
+            for i, t in enumerate(self.tiles):
+                self.draw_tile(t, is_selected=(i == self.selected_tile_index))
+                if self.show_qr_codes:
+                    self.draw_tile_qr(t)
         self.draw_axes()
 
     def nudge_pedestal_inside_tile(self, ped_pos, ped_radius, footprint):
@@ -976,85 +983,83 @@ class GLWidget(QOpenGLWidget):
             glEnd()
         glLineWidth(1.0)
         # Attempt to draw a QR overlay for the tile (created lazily)
-        try:
-            self.draw_tile_qr(tile)
-        except Exception:
-            # Don't let QR generation break rendering
-            pass
-
-    def _generate_qr_pil_image(self, tile, px_size=256):
-        """Create a square RGBA PIL image containing the QR for `tile`."""
-        try:
-            payload = self.build_qr_payload_for_tile(tile)
-        except Exception:
-            payload = json.dumps({"id": tile.qr_data or ""}, separators=(',', ':'))
-
-        qr = qrcode.QRCode(box_size=8, border=2)
-        qr.add_data(payload)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
-        img = img.resize((px_size, px_size), resample=Image.NEAREST)
-        return img
-
-    def _upload_pil_image_as_texture(self, pil_img):
-        """Upload a PIL RGBA image to OpenGL and return the texture id."""
-        data = pil_img.tobytes("raw", "RGBA")
-        w, h = pil_img.size
-        tex_id = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_2D, int(tex_id))
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data)
-        return int(tex_id)
+        if self.show_qr_codes:
+            try:
+                self.draw_tile_qr(tile)
+            except Exception:
+                # Don't let QR generation break rendering
+                pass
 
     def _ensure_tile_qr_texture(self, tile):
-        """Create and attach a QR texture to `tile` if not already present.
-
-        This must be called while an OpenGL context is current (e.g. inside paintGL).
-        """
-        if getattr(tile, "qr_texture_id", None):
+        """Create and cache an OpenGL texture for the tile's QR code."""
+        if tile is None or getattr(tile, "qr_texture_id", None):
             return
-        try:
-            img = self._generate_qr_pil_image(tile, px_size=256)
-            tex = self._upload_pil_image_as_texture(img)
-            tile.qr_texture_id = tex
-            # size in world units (meters) used when drawing the quad
-            tile.qr_size = min(tile.xtile, tile.ytile) * 0.5
-        except Exception:
-            tile.qr_texture_id = None
-            tile.qr_size = 0.0
-        if tile is None:
-            return json.dumps({}, sort_keys=True, separators=(',', ':'))
+
+        payload = str(tile.qr_data or "")
+        if not payload:
+            idx = self.tiles.index(tile) + 1 if tile in self.tiles else (id(tile) & 0xFFFF)
+            payload = f"TILE-{idx}"
+
+        qr_code = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=6,
+            border=1,
+        )
+        qr_code.add_data(payload)
+        qr_code.make(fit=True)
+
+        qr_img = qr_code.make_image(fill_color="black", back_color="white")
+        if hasattr(qr_img, "get_image"):
+            qr_img = qr_img.get_image()
+        if not isinstance(qr_img, Image.Image):
+            raise RuntimeError("QR generation did not return a PIL image.")
+
+        qr_img = qr_img.convert("RGBA")
+        side = max(qr_img.width, qr_img.height)
+        if qr_img.width != qr_img.height:
+            square = Image.new("RGBA", (side, side), (255, 255, 255, 0))
+            offset = ((side - qr_img.width) // 2, (side - qr_img.height) // 2)
+            square.paste(qr_img, offset)
+            qr_img = square
+        max_tex_size = 256
+        if side > max_tex_size:
+            qr_img = qr_img.resize((max_tex_size, max_tex_size), Image.NEAREST)
+            side = max_tex_size
+        else:
+            side = qr_img.width
+
+        qr_img = qr_img.transpose(Image.FLIP_TOP_BOTTOM)
+        img_data = qr_img.tobytes()
+
+        texture_id = glGenTextures(1)
+        if isinstance(texture_id, (list, tuple)):
+            texture_id = texture_id[0]
+        texture_id = int(texture_id)
+        if texture_id <= 0:
+            raise RuntimeError("Failed to allocate QR texture.")
+
+        glBindTexture(GL_TEXTURE_2D, texture_id)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, side, side, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
 
         footprint = tile.get_actual_xy_footprint()
-        footprint_mm = []
+        qr_extent = None
         if footprint:
-            for x, y in footprint:
-                footprint_mm.append({
-                    "x_mm": round(x * 1000.0, 3),
-                    "y_mm": round(y * 1000.0, 3),
-                })
+            xs = [p[0] for p in footprint]
+            ys = [p[1] for p in footprint]
+            width = max(xs) - min(xs)
+            length = max(ys) - min(ys)
+            qr_extent = min(width, length) * 0.6
+        if qr_extent is None or qr_extent <= EPSILON:
+            qr_extent = max(EPSILON, min(tile.xtile, tile.ytile) * 0.6)
 
-        ped_payload = []
-        for ped in getattr(tile, "pedestal_list", []) or []:
-            px_mm, py_mm, h_mm = ped
-            ped_payload.append({
-                "x_mm": round(px_mm, 3),
-                "y_mm": round(py_mm, 3),
-                "h_mm": round(h_mm, 3),
-            })
-
-        payload = {
-            "id": tile.qr_data or "",
-            "pedestals": ped_payload,
-        }
-        if footprint_mm:
-            payload["footprint"] = footprint_mm
-
-        return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        tile.qr_texture_id = texture_id
+        tile.qr_size = qr_extent
 
     def draw_tile_qr(self, tile):
         """Draw the tile's QR texture and a thin white bounding frame."""
@@ -1494,6 +1499,9 @@ class GLWidget(QOpenGLWidget):
 
 # -----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
+    def toggle_qr_visibility(self, state):
+        self.gl_widget.show_qr_codes = bool(state)
+        self.gl_widget.update()
     def __init__(self):
         super().__init__()
         self.setWindowTitle("3D Tile Layout Application (v3)"); self.setGeometry(50,50,1400,900)
@@ -1557,7 +1565,13 @@ class MainWindow(QMainWindow):
         self.elevmap_cb = QtWidgets.QCheckBox("Show Elevation Map")
         self.showtiles_cb = QtWidgets.QCheckBox("Show Tiles")
         self.showtiles_cb.setChecked(True)
-        vis_f.addRow(self.wireframe_cb); vis_f.addRow(self.elevmap_cb); vis_f.addRow(self.showtiles_cb)
+        self.showqr_cb = QtWidgets.QCheckBox("Show QR Codes")
+        self.showqr_cb.setChecked(True)
+        self.showqr_cb.stateChanged.connect(self.toggle_qr_visibility)
+        vis_f.addRow(self.wireframe_cb)
+        vis_f.addRow(self.elevmap_cb)
+        vis_f.addRow(self.showtiles_cb)
+        vis_f.addRow(self.showqr_cb)
         vis_g.setLayout(vis_f); self.control_layout.addWidget(vis_g)
 
         self.comp_btn = QPushButton("Compute and Visualize Layout"); self.comp_btn.clicked.connect(self.update_visualization)
@@ -1675,6 +1689,7 @@ class MainWindow(QMainWindow):
         self.gl_widget.show_wireframe = self.wireframe_cb.isChecked()
         self.gl_widget.show_elevation_map = self.elevmap_cb.isChecked()
         self.gl_widget.show_tiles = self.showtiles_cb.isChecked()
+        self.gl_widget.show_qr_codes = self.showqr_cb.isChecked()
         return params
 
     def update_visualization(self):
