@@ -1,5 +1,6 @@
 import sys
 import math
+import json
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -139,6 +140,7 @@ class Tile3D:
         self.is_cut = is_cut
         self.cut_polygon_xy = cut_polygon_xy
         self.qr_data = qr_data
+        self.pedestal_list = []
         self.corners_bottom_xyz = []
         self.corners_top_xyz = []
       # Cached picking helpers (set by prepare_pick_geometry)
@@ -886,6 +888,22 @@ class GLWidget(QOpenGLWidget):
                     if centroid:
                         ped["pos_xy"] = centroid
                         break
+# Build pedestal associations for each tile footprint
+        for tile in initial_tiles:
+            footprint = tile.get_actual_xy_footprint()
+            if not footprint:
+                tile.pedestal_list = []
+                continue
+
+            ped_entries = []
+            for ped in self.pedestals:
+                px, py = ped["pos_xy"]
+                tolerance = max(ped.get("radius", 0.0), 1e-6)
+                if point_in_polygon((px, py), footprint, tolerance=tolerance):
+                    ped_entries.append((px * 1000.0, py * 1000.0, ped["height"] * 1000.0))
+
+            ped_entries.sort(key=lambda item: (item[1], item[0], item[2]))
+            tile.pedestal_list = ped_entries
 
         # ============================================================
 
@@ -955,6 +973,82 @@ class GLWidget(QOpenGLWidget):
             for v in tile.corners_top_xyz: glVertex3f(v.x(), v.y(), v.z() + 0.0005)
             glEnd()
         glLineWidth(1.0)
+def build_qr_payload_for_tile(self, tile):
+        """Return a compact JSON payload describing the tile's QR metadata."""
+        if tile is None:
+            return json.dumps({}, sort_keys=True, separators=(',', ':'))
+
+        footprint = tile.get_actual_xy_footprint()
+        footprint_mm = []
+        if footprint:
+            for x, y in footprint:
+                footprint_mm.append({
+                    "x_mm": round(x * 1000.0, 3),
+                    "y_mm": round(y * 1000.0, 3),
+                })
+
+        ped_payload = []
+        for ped in getattr(tile, "pedestal_list", []) or []:
+            px_mm, py_mm, h_mm = ped
+            ped_payload.append({
+                "x_mm": round(px_mm, 3),
+                "y_mm": round(py_mm, 3),
+                "h_mm": round(h_mm, 3),
+            })
+
+        payload = {
+            "id": tile.qr_data or "",
+            "pedestals": ped_payload,
+        }
+        if footprint_mm:
+            payload["footprint"] = footprint_mm
+
+        return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+    def draw_tile_qr(self, tile):
+        """Draw the tile's QR texture and a thin white bounding frame."""
+        if tile is None or not tile.corners_top_xyz:
+            return
+
+        texture_id = getattr(tile, "qr_texture_id", None)
+        if not texture_id:
+            return
+
+        qr_size = getattr(tile, "qr_size", min(tile.xtile, tile.ytile) * 0.5)
+        if qr_size <= EPSILON:
+            return
+
+        num_pts = len(tile.corners_top_xyz)
+        cx = sum(v.x() for v in tile.corners_top_xyz) / num_pts
+        cy = sum(v.y() for v in tile.corners_top_xyz) / num_pts
+        cz = sum(v.z() for v in tile.corners_top_xyz) / num_pts
+
+        half = qr_size / 2.0
+        was_texture_enabled = bool(glIsEnabled(GL_TEXTURE_2D))
+        if not was_texture_enabled:
+            glEnable(GL_TEXTURE_2D)
+
+        glBindTexture(GL_TEXTURE_2D, int(texture_id))
+        glColor3f(1.0, 1.0, 1.0)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 0.0); glVertex3f(cx - half, cy - half, cz + 0.002)
+        glTexCoord2f(1.0, 0.0); glVertex3f(cx + half, cy - half, cz + 0.002)
+        glTexCoord2f(1.0, 1.0); glVertex3f(cx + half, cy + half, cz + 0.002)
+        glTexCoord2f(0.0, 1.0); glVertex3f(cx - half, cy + half, cz + 0.002)
+        glEnd()
+
+        border = qr_size * 1.05
+        glDisable(GL_TEXTURE_2D)
+        glColor3f(1.0, 1.0, 1.0)
+        glBegin(GL_LINE_LOOP)
+        glVertex3f(cx - border / 2.0, cy - border / 2.0, cz + 0.003)
+        glVertex3f(cx + border / 2.0, cy - border / 2.0, cz + 0.003)
+        glVertex3f(cx + border / 2.0, cy + border / 2.0, cz + 0.003)
+        glVertex3f(cx - border / 2.0, cy + border / 2.0, cz + 0.003)
+        glEnd()
+
+        if was_texture_enabled:
+            glEnable(GL_TEXTURE_2D)
 
     def create_unit_cylinder_dl(self, segments=12):
         dl = glGenLists(1)
