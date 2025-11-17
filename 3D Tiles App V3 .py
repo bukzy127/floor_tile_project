@@ -1,6 +1,7 @@
 import sys
 import math
 import numpy as np
+from pathlib import Path
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QDialog,
@@ -1178,7 +1179,9 @@ class GLWidget(QOpenGLWidget):
         report_lines.append("=" * 84)
         report_lines.append("RAISED FLOOR LAYOUT REPORT".center(84))
         report_lines.append("=" * 84)
-        report_lines.append(f"Generated on: {QtCore.QDateTime.currentDateTime().toString(QtCore.Qt.DefaultLocaleLongDate)}")
+        # FIX: PyQt6 removed Qt.DefaultLocaleLongDate → format explicitly
+        generated_timestamp = QtCore.QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
+        report_lines.append(f"Generated on: {generated_timestamp}")
         report_lines.append("\n")
 
         # Tiles Section
@@ -1537,7 +1540,7 @@ class MainWindow(QMainWindow):
             self.gl_widget.export_scene_to_obj_file(path)
             QMessageBox.information(self, "Export Successful", f"Scene successfully exported to:\n{path}")
 
-    def export_layout_report(self):
+    def export_layout_report(self):  
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Export Layout Report",
@@ -1548,16 +1551,15 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        # FIX: determine whether the user selected a file or a folder
-        base = os.path.basename(path)
+        resolved_path = Path(path)
 
-        if base == "" or "." not in base:
-            # User selected only a folder → append default filename
-            path = os.path.join(path, "layout_report.txt")
-        else:
-            # User selected a filename
-            if not path.lower().endswith(".txt"):
-                path = path + ".txt"
+        if resolved_path.suffix.lower() != ".txt":
+            if resolved_path.is_dir():
+                resolved_path = resolved_path / "layout_report.txt"
+            else:
+                resolved_path = resolved_path.with_suffix(".txt")
+
+        path = str(resolved_path)
 
         try:
             report_string = self.gl_widget.generate_layout_report_string()
@@ -1571,8 +1573,8 @@ class MainWindow(QMainWindow):
             print("[ERROR - Could not write layout report]", e)
             # Error box is safe
             QMessageBox.critical(self, "Export Error", str(e))
-    # --- END: New methods for Exporting ---
-
+            
+        
 if __name__ == "__main__":
     # Set the desired OpenGL format BEFORE creating the application
     fmt = QSurfaceFormat()
