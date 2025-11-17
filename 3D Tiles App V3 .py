@@ -29,6 +29,29 @@ def polygon_area_2d(poly):
     y = [p[1] for p in poly]
     return 0.5 * abs(sum(x[i] * y[i+1] - x[i+1] * y[i] for i in range(-1, len(poly)-1)))
 
+def polygon_centroid_2d(poly):
+    """Return the centroid of a simple 2D polygon."""
+    if not poly or len(poly) < 3:
+        return None
+    signed_area = 0.0
+    cx = 0.0
+    cy = 0.0
+    for i in range(len(poly)):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % len(poly)]
+        cross = x0 * y1 - x1 * y0
+        signed_area += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+    signed_area *= 0.5
+    if abs(signed_area) < EPSILON:
+        avg_x = sum(p[0] for p in poly) / len(poly)
+        avg_y = sum(p[1] for p in poly) / len(poly)
+        return (avg_x, avg_y)
+    cx /= (6.0 * signed_area)
+    cy /= (6.0 * signed_area)
+    return (cx, cy)
+
 def point_on_segment_2d(pt, a, b, tolerance=0.0):
     """Return True if pt lies within tolerance of the line segment AB."""
     ax, ay = a
@@ -440,6 +463,57 @@ class GLWidget(QOpenGLWidget):
             for i, t in enumerate(self.tiles): self.draw_tile(t, is_selected=(i == self.selected_tile_index))
         self.draw_axes()
 
+    def nudge_pedestal_inside_tile(self, ped_pos, ped_radius, footprint):
+        """
+        Ensure pedestal (circle center + radius) is fully inside the polygon footprint.
+        If outside, move inward along direction toward polygon centroid by radius.
+        """
+        px, py = ped_pos
+
+        # quick success path: if already inside by radius margin, keep
+        if point_in_polygon((px, py), footprint, tolerance=ped_radius + 1e-6):
+            min_dist = float('inf')
+            for i in range(len(footprint)):
+                a = footprint[i]
+                b = footprint[(i + 1) % len(footprint)]
+                ax, ay = a; bx, by = b
+                seg_len = math.hypot(bx - ax, by - ay)
+                if seg_len < EPSILON:
+                    continue
+                t = max(0.0, min(1.0, ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / (seg_len * seg_len)))
+                cx = ax + t * (bx - ax); cy = ay + t * (by - ay)
+                d = math.hypot(px - cx, py - cy)
+                min_dist = min(min_dist, d)
+
+            if min_dist >= ped_radius - 1e-6:
+                return (px, py)
+
+        # move toward centroid until inside
+        cx, cy = polygon_centroid_2d(footprint)
+        if cx is None:
+            cx = sum(p[0] for p in footprint) / len(footprint)
+            cy = sum(p[1] for p in footprint) / len(footprint)
+
+        dir_x = px - cx
+        dir_y = py - cy
+        length = math.hypot(dir_x, dir_y)
+        if length < EPSILON:
+            return (px, py)
+
+        dir_x /= length
+        dir_y /= length
+
+        attempt_pos = (px - dir_x * ped_radius,
+                       py - dir_y * ped_radius)
+
+        for k in range(10):
+            if point_in_polygon(attempt_pos, footprint, tolerance=ped_radius):
+                return attempt_pos
+            attempt_pos = (attempt_pos[0] - dir_x * (ped_radius * 0.4),
+                           attempt_pos[1] - dir_y * (ped_radius * 0.4))
+
+        return (cx, cy)
+
     def compute_and_build_layout(self, room_params_input, tile_params, slope_params):
         """Main layout algorithm updated to support polygonal rooms and irregular elevation models.
         room_params_input should include keys:
@@ -665,7 +739,153 @@ class GLWidget(QOpenGLWidget):
                     if height >= min_pedestal_height:
                         final_pedestals_map[key] = {'pos_xy': (adj_px, adj_py), 'base_z': base_z, 'height': height, 'radius': pedestal_cap_radius}
 
-        self.pedestals = list(final_pedestals_map.values())
+        # --- Nudge pedestals inside tile footprints ---
+        adjusted_pedestals = []
+        for ped in final_pedestals_map.values():
+            px, py = ped['pos_xy']
+            radius = ped.get('radius', 0.0)
+
+            best_tile = None
+            best_dist = float('inf')
+
+            for tile in initial_tiles:
+                fp = tile.get_actual_xy_footprint()
+                if not fp:
+                    continue
+
+                if point_in_polygon((px, py), fp, tolerance=radius):
+                    best_tile = tile
+                    break
+
+                centroid = polygon_centroid_2d(fp)
+                if centroid:
+                    cx, cy = centroid
+                    d = math.hypot(px - cx, py - cy)
+                    if d < best_dist:
+                        best_dist = d
+                        best_tile = tile
+
+            if best_tile:
+                fp = best_tile.get_actual_xy_footprint()
+                new_pos = self.nudge_pedestal_inside_tile((px, py), radius, fp)
+                ped['pos_xy'] = new_pos
+
+            adjusted_pedestals.append(ped)
+        self.pedestals = adjusted_pedestals
+
+        # ============================================================
+        # PEDESTAL OPTIMIZATION (Option A + Option D)
+        # ============================================================
+
+        # A) Adaptive minimum spacing based on pedestal radius
+        base_spacing = 0.10        # default spacing
+        large_tile_spacing = 0.15  # for large tiles
+        small_tile_spacing = 0.07  # for micro pedestals
+
+        def pedestal_min_spacing(pedestal):
+            radius = pedestal.get("radius", 0.035)
+            if radius > 0.033:
+                return large_tile_spacing     # full tile corner
+            elif radius < 0.020:
+                return small_tile_spacing     # tiny cut-tile pedestal
+            return base_spacing
+
+        def _tile_centroid_for_idx(idx):
+            footprint = initial_tiles[idx].get_actual_xy_footprint()
+            if not footprint:
+                return None
+            centroid = polygon_centroid_2d(footprint)
+            if centroid:
+                return centroid
+            avg_x = sum(p[0] for p in footprint) / len(footprint)
+            avg_y = sum(p[1] for p in footprint) / len(footprint)
+            return (avg_x, avg_y)
+
+        def _point_in_any_tile(px, py, tile_indices):
+            for t_idx in tile_indices:
+                footprint = initial_tiles[t_idx].get_actual_xy_footprint()
+                if footprint and point_in_polygon((px, py), footprint, tolerance=1e-6):
+                    return True
+            return False
+
+        # B) Merge pedestals into centroid clusters
+        merged = []
+
+        for ped in self.pedestals:
+            px, py = ped["pos_xy"]
+            placed = False
+
+            for cluster in merged:
+                cx, cy = cluster["pos_xy"]
+                spacing = pedestal_min_spacing(cluster)
+
+                if (px - cx)**2 + (py - cy)**2 < spacing**2:
+                    # merge pedestals into centroid
+                    new_x = (cx + px) / 2.0
+                    new_y = (cy + py) / 2.0
+                    cluster["pos_xy"] = (new_x, new_y)
+
+                    # average height + base_z for consistency
+                    cluster["base_z"] = (cluster["base_z"] + ped["base_z"]) / 2.0
+                    cluster["height"] = (cluster["height"] + ped["height"]) / 2.0
+                    combined_tiles = list(dict.fromkeys(cluster.get("tiles", []) + ped.get("tiles", [])))
+                    if combined_tiles:
+                        cluster["tiles"] = combined_tiles
+
+                    placed = True
+                    break
+
+            if not placed:
+                merged.append(ped)
+
+        self.pedestals = merged
+
+        # Ensure every pedestal tied to edge tiles remains inside at least one of its footprints.
+        for ped in self.pedestals:
+            tile_indices = ped.get("tiles", [])
+            if not tile_indices:
+                continue
+            px, py = ped["pos_xy"]
+            if _point_in_any_tile(px, py, tile_indices):
+                continue
+            dir_x = dir_y = 0.0
+            contributors = 0
+            for t_idx in tile_indices:
+                centroid = _tile_centroid_for_idx(t_idx)
+                if not centroid:
+                    continue
+                dx = centroid[0] - px
+                dy = centroid[1] - py
+                length = math.hypot(dx, dy)
+                if length > EPSILON:
+                    dir_x += dx / length
+                    dir_y += dy / length
+                    contributors += 1
+            if contributors == 0:
+                continue
+            norm = math.hypot(dir_x, dir_y)
+            if norm < EPSILON:
+                continue
+            dir_x /= norm
+            dir_y /= norm
+            step = pedestal_min_spacing(ped) * 0.5
+            adjusted = False
+            for _ in range(12):
+                test_x = px + dir_x * step
+                test_y = py + dir_y * step
+                if _point_in_any_tile(test_x, test_y, tile_indices):
+                    ped["pos_xy"] = (test_x, test_y)
+                    adjusted = True
+                    break
+                step *= 0.5
+            if not adjusted:
+                for t_idx in tile_indices:
+                    centroid = _tile_centroid_for_idx(t_idx)
+                    if centroid:
+                        ped["pos_xy"] = centroid
+                        break
+
+        # ============================================================
 
         # 4. Filter tiles to keep only those that are fully supported: all corner points must have pedestals nearby
         supported_corners_keys = final_pedestals_map.keys()
