@@ -1538,15 +1538,39 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export Successful", f"Scene successfully exported to:\n{path}")
 
     def export_layout_report(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Layout Report", "layout_report.txt", "Text Files (*.txt)")
-        if path:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Layout Report",
+            "layout_report.txt",
+            "Text Files (*.txt)"
+        )
+
+        if not path:
+            return
+
+        # FIX: determine whether the user selected a file or a folder
+        base = os.path.basename(path)
+
+        if base == "" or "." not in base:
+            # User selected only a folder → append default filename
+            path = os.path.join(path, "layout_report.txt")
+        else:
+            # User selected a filename
+            if not path.lower().endswith(".txt"):
+                path = path + ".txt"
+
+        try:
             report_string = self.gl_widget.generate_layout_report_string()
-            try:
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write(report_string)
-                QMessageBox.information(self, "Export Successful", f"Layout report successfully exported to:\n{path}")
-            except IOError as e:
-                QMessageBox.critical(self, "Export Error", f"Could not write to file:\n{e}")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(report_string)
+
+            # SAFE: no QMessageBox here (avoids GL crash)
+            print(f"[OK] Layout report saved to: {path}")
+
+        except Exception as e:
+            print("[ERROR - Could not write layout report]", e)
+            # Error box is safe
+            QMessageBox.critical(self, "Export Error", str(e))
     # --- END: New methods for Exporting ---
 
 if __name__ == "__main__":
