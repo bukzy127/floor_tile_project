@@ -1,6 +1,25 @@
+def generate_qr_png(label, path, size=200):
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=2,
+    )
+    qr.add_data(str(label))
+    qr.make(fit=True)
+
+    img = qr.make_image(fill_color="black", back_color="white")
+    img = img.resize((size, size), Image.NEAREST)
+    img.save(path)
 import sys
 import math
 import json
+try:
+    import ezdxf
+except ImportError:
+    ezdxf = None
+    print("ERROR: ezdxf not installed in this environment")
+    print("Run:  .venv\\Scripts\\activate && pip install ezdxf")
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -1221,9 +1240,21 @@ class GLWidget(QOpenGLWidget):
         glLineWidth(2.5); glDisable(GL_LIGHTING)
         glBegin(GL_LINES)
         ax_len = max(0.5, self.room_dims.get('width', 1.0) * 0.15, self.room_dims.get('length', 1.0) * 0.15)
-        glColor3f(1,0,0); glVertex3f(0,0,0); glVertex3f(ax_len,0,0)
-        glColor3f(0,1,0); glVertex3f(0,0,0); glVertex3f(0,ax_len,0)
-        glColor3f(0,0,1); glVertex3f(0,0,0); glVertex3f(0,0,ax_len)
+
+        if self.room_polygon_xy:
+            xs = [p[0] for p in self.room_polygon_xy]
+            ys = [p[1] for p in self.room_polygon_xy]
+            origin_x = min(xs)
+            origin_y = min(ys)
+        else:
+            origin_x = origin_y = 0.0
+
+        origin_z = self.original_slope_func(origin_x, origin_y)
+
+        glColor3f(1,0,0); glVertex3f(origin_x, origin_y, origin_z); glVertex3f(origin_x + ax_len, origin_y, origin_z)
+        glColor3f(0,1,0); glVertex3f(origin_x, origin_y, origin_z); glVertex3f(origin_x, origin_y + ax_len, origin_z)
+        glColor3f(0,0,1); glVertex3f(origin_x, origin_y, origin_z); glVertex3f(origin_x, origin_y, origin_z + ax_len)
+
         glEnd()
         glEnable(GL_LIGHTING); glLineWidth(1.0)
 
@@ -1337,7 +1368,8 @@ class GLWidget(QOpenGLWidget):
         report_lines.append("=" * 84)
         report_lines.append("RAISED FLOOR LAYOUT REPORT".center(84))
         report_lines.append("=" * 84)
-        report_lines.append(f"Generated on: {QtCore.QDateTime.currentDateTime().toString(QtCore.Qt.DefaultLocaleLongDate)}")
+        # Use Python datetime formatting to avoid PyQt6 enum compatibility issues
+        report_lines.append(f"Generated on: {datetime.now().strftime('%c')}")
         report_lines.append("\n")
 
         # Tiles Section
@@ -1495,6 +1527,171 @@ class GLWidget(QOpenGLWidget):
         except IOError as e:
             print(f"Error exporting OBJ file: {e}")
 
+    def export_scene_to_dxf_file(self, file_path):
+        import ezdxf
+        try:
+            doc = ezdxf.new(dxfversion="R2010")
+            msp = doc.modelspace()
+
+            # -----------------------------------------
+            # 1. EXPORT TILES AS FULL 3D MESHES
+            # -----------------------------------------
+            for tile in self.tiles:
+                top = tile.corners_top_xyz
+                bottom = tile.corners_bottom_xyz
+                if not top or not bottom:
+                    continue
+
+                # Top face triangulation
+                for i in range(len(top) - 2):
+                    msp.add_3dface([
+                        (top[0].x(), top[0].y(), top[0].z()),
+                        (top[i+1].x(), top[i+1].y(), top[i+1].z()),
+                        (top[i+2].x(), top[i+2].y(), top[i+2].z()),
+                    ], dxfattribs={'layer': 'TILES'})
+
+                # Bottom face
+                for i in range(len(bottom) - 2):
+                    msp.add_3dface([
+                        (bottom[0].x(), bottom[0].y(), bottom[0].z()),
+                        (bottom[i+1].x(), bottom[i+1].y(), bottom[i+1].z()),
+                        (bottom[i+2].x(), bottom[i+2].y(), bottom[i+2].z()),
+                    ], dxfattribs={'layer': 'TILES'})
+
+                # Side faces
+                for i in range(len(top)):
+                    p1t = top[i]
+                    p2t = top[(i+1) % len(top)]
+                    p1b = bottom[i]
+                    p2b = bottom[(i+1) % len(bottom)]
+
+                    msp.add_3dface([
+                        (p1b.x(), p1b.y(), p1b.z()),
+                        (p2b.x(), p2b.y(), p2b.z()),
+                        (p2t.x(), p2t.y(), p2t.z()),
+                        (p1t.x(), p1t.y(), p1t.z()),
+                    ], dxfattribs={'layer': 'TILES'})
+
+            # -----------------------------------------
+            # 2. EXPORT PEDESTALS AS 3D CYLINDERS
+            # -----------------------------------------
+            for ped in self.pedestals:
+                x, y = ped["pos_xy"]
+                z = ped["base_z"]
+                r = ped["radius"]
+                h = ped["height"]
+                segments = 16
+
+                for i in range(segments):
+                    a1 = 2 * math.pi * i / segments
+                    a2 = 2 * math.pi * (i + 1) / segments
+
+                    p1b = (x + r * math.cos(a1), y + r * math.sin(a1), z)
+                    p2b = (x + r * math.cos(a2), y + r * math.sin(a2), z)
+                    p1t = (p1b[0], p1b[1], z + h)
+                    p2t = (p2b[0], p2b[1], z + h)
+
+                    msp.add_3dface([
+                        p1b, p2b, p2t, p1t
+                    ], dxfattribs={'layer': 'PEDESTALS'})
+
+            # -----------------------------------------
+            # 3. EXPORT REAL QR CODE IMAGES
+            # -----------------------------------------
+            import os
+
+            # Ensure QRCODES layer exists
+            if 'QRCODES' not in doc.layers:
+                doc.layers.new('QRCODES', dxfattribs={'color': 3})
+
+            # Output folder next to DXF file
+            img_dir = os.path.join(os.path.dirname(file_path), "qr_images")
+            os.makedirs(img_dir, exist_ok=True)
+
+            for tile in self.tiles:
+                fp = tile.get_actual_xy_footprint()
+                if not fp:
+                    continue
+
+                # Tile center
+                min_x = min(p[0] for p in fp)
+                max_x = max(p[0] for p in fp)
+                min_y = min(p[1] for p in fp)
+                max_y = max(p[1] for p in fp)
+                cx = (min_x + max_x) / 2
+                cy = (min_y + max_y) / 2
+                cz = tile.corners_top_xyz[0].z() + 0.01  # slightly above surface
+
+                label = str(tile.qr_data)
+                img_path = os.path.join(img_dir, f"{label}.png")
+
+                # Create the QR image file
+                generate_qr_png(label, img_path, size=250)
+
+                # Register image definition
+                img = Image.open(img_path)
+                img_def = doc.add_image_def(
+                    filename=img_path,
+                    size_in_pixel=img.size
+                )
+
+                # Insert image as a 3D overlay
+                msp.add_image(
+                    img_def,
+                    (cx - tile.xtile/2, cy - tile.ytile/2, cz),
+                    (0.2, 0.2),  # size_in_units: width, height in drawing units
+                    rotation=0,
+                    dxfattribs={'layer': 'QRCODES'}
+                )
+
+            # -----------------------------------------
+            # Save output (robustly, handling permission errors)
+            # -----------------------------------------
+            try:
+                out_path = Path(file_path)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # If destination exists, attempt to remove it first (may fail if file locked)
+                if out_path.exists():
+                    try:
+                        out_path.unlink()
+                    except PermissionError:
+                        print(f"Permission denied removing existing file: {out_path}")
+                        # We'll save to a temporary file and attempt to replace
+
+                # Save to a temporary file first
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                tmp_path = out_path.with_name(out_path.stem + f".tmp_{timestamp}.dxf")
+                try:
+                    doc.saveas(str(tmp_path))
+                except PermissionError as e:
+                    print("Permission denied when writing temporary DXF:", e)
+                    raise
+
+                # Move temp file to final destination (atomic on most platforms)
+                try:
+                    os.replace(str(tmp_path), str(out_path))
+                    print("DXF successfully written to:", out_path)
+                except PermissionError:
+                    # Destination still not writable; save to alternative timestamped file
+                    alt_path = out_path.with_name(out_path.stem + f".{timestamp}.dxf")
+                    try:
+                        os.replace(str(tmp_path), str(alt_path))
+                        print(f"Destination locked; saved DXF to alternative path: {alt_path}")
+                    except Exception as e:
+                        print("Failed to move DXF to final or alternative location:", e)
+                        raise
+
+            except PermissionError as e:
+                print("DXF Export Permission Error:", e)
+                print(f"Check file is not open in another program and you have write permissions to: {file_path}")
+            except Exception as e:
+                print("DXF Export Error:", e)
+
+        except Exception as e:
+            # Outer try-catch for the DXF exporter
+            print("DXF Export Error (fatal):", e)
+
     # --- END: Exporting Methods ---
 
 # -----------------------------------------------------------------------------
@@ -1585,6 +1782,10 @@ class MainWindow(QMainWindow):
         self.export_report_btn = QPushButton("Export Layout Report (.txt)")
         self.export_report_btn.clicked.connect(self.export_layout_report)
         self.control_layout.addWidget(self.export_report_btn)
+
+        self.export_dxf_btn = QPushButton("Export to AutoCAD (.DXF)")
+        self.export_dxf_btn.clicked.connect(self.export_scene_to_dxf)
+        self.control_layout.addWidget(self.export_dxf_btn)
         # --- END: New UI elements for Exporting ---
 
         self.control_layout.addStretch()
@@ -1705,6 +1906,19 @@ class MainWindow(QMainWindow):
         if path:
             self.gl_widget.export_scene_to_obj_file(path)
             QMessageBox.information(self, "Export Successful", f"Scene successfully exported to:\n{path}")
+
+    def export_scene_to_dxf(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export to AutoCAD DXF",
+            "tile_layout.dxf",
+            "AutoCAD DXF (*.dxf)"
+        )
+        if not path:
+            return
+        self.gl_widget.export_scene_to_dxf_file(path)
+        QMessageBox.information(self, "Export Successful",
+                                f"DXF exported to:\n{path}")
 
     def export_layout_report(self):  
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
