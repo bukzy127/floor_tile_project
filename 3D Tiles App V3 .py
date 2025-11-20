@@ -37,6 +37,7 @@ from OpenGL.GLU import *
 import os, faulthandler
 import qrcode
 from PIL import Image
+import io
 faulthandler.enable()
 # Workaround for macOS Qt5 + QOpenGLWidget crashes
 os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
@@ -261,6 +262,39 @@ class InfoDialog(QDialog):
         self.setWindowTitle("Clicked Tile Information")
         layout = QFormLayout(self)
         layout.addRow("QR Data (ID):", QLabel(str(tile.qr_data or "N/A")))
+
+        # Generate an inline QR image for the dialog (PIL -> QPixmap via bytes)
+        try:
+            payload = str(tile.qr_data or "")
+            if not payload:
+                payload = "TILE"
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_M,
+                box_size=6,
+                border=1,
+            )
+            qr.add_data(payload)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white")
+            if hasattr(qr_img, 'get_image'):
+                qr_img = qr_img.get_image()
+            qr_img = qr_img.convert('RGBA')
+            # Save to bytes
+            bio = io.BytesIO()
+            qr_img.save(bio, format='PNG')
+            bio.seek(0)
+            from PyQt6.QtGui import QPixmap
+            pix = QPixmap()
+            pix.loadFromData(bio.getvalue(), 'PNG')
+            # Scale pixmap to reasonable dialog size
+            pix = pix.scaled(128, 128, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+            img_label = QLabel()
+            img_label.setPixmap(pix)
+            layout.addRow("QR Code:", img_label)
+        except Exception:
+            # If QR generation fails, skip image silently
+            pass
 
         footprint = tile.get_actual_xy_footprint()
         origin_display, actual_dims_display = "N/A", "N/A"
