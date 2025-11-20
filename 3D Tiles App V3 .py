@@ -1635,11 +1635,22 @@ class GLWidget(QOpenGLWidget):
                     size_in_pixel=img.size
                 )
 
-                # Insert image as a 3D overlay
+                # Compute QR size as 30% of tile footprint and place at top-right
+                tile_w = (max_x - min_x) if (max_x is not None and min_x is not None) else getattr(tile, 'xtile', 0.0)
+                tile_h = (max_y - min_y) if (max_y is not None and min_y is not None) else getattr(tile, 'ytile', 0.0)
+                qr_pct = 0.30
+                qr_w = tile_w * qr_pct
+                qr_h = tile_h * qr_pct
+
+                # Insert point for image: lower-left corner of the QR image.
+                # To place QR in top-right of tile, compute offset from tile center.
+                insert_x = cx + (tile_w / 2.0) - qr_w
+                insert_y = cy + (tile_h / 2.0) - qr_h
+
                 msp.add_image(
                     img_def,
-                    (cx - tile.xtile/2, cy - tile.ytile/2, cz),
-                    (0.2, 0.2),  # size_in_units: width, height in drawing units
+                    (insert_x, insert_y, cz),
+                    (qr_w, qr_h),  # size_in_units: width, height in drawing units
                     rotation=0,
                     dxfattribs={'layer': 'QRCODES'}
                 )
