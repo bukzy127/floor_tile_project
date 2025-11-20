@@ -423,6 +423,7 @@ class GLWidget(QOpenGLWidget):
         self.show_tiles = True
         self.show_qr_codes = True 
 
+        self.qr_pct = 0.10  # Default QR code size percent
 
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
@@ -1073,9 +1074,10 @@ class GLWidget(QOpenGLWidget):
             ys = [p[1] for p in footprint]
             width = max(xs) - min(xs)
             length = max(ys) - min(ys)
-            qr_extent = min(width, length) * 0.6
+            qr_pct = getattr(self, "qr_pct", 0.10)
+            qr_extent = min(width, length) * qr_pct
         if qr_extent is None or qr_extent <= EPSILON:
-            qr_extent = max(EPSILON, min(tile.xtile, tile.ytile) * 0.6)
+            qr_extent = max(EPSILON, min(tile.xtile, tile.ytile) * getattr(self, "qr_pct", 0.10))
 
         tile.qr_texture_id = texture_id
         tile.qr_size = qr_extent
@@ -1100,10 +1102,26 @@ class GLWidget(QOpenGLWidget):
         if qr_size <= EPSILON:
             return
 
+        # Default center: centroid of top corners
         num_pts = len(tile.corners_top_xyz)
-        cx = sum(v.x() for v in tile.corners_top_xyz) / num_pts
-        cy = sum(v.y() for v in tile.corners_top_xyz) / num_pts
         cz = sum(v.z() for v in tile.corners_top_xyz) / num_pts
+
+        # Position QR at top-right corner of the tile footprint (with small margin)
+        footprint = tile.get_actual_xy_footprint()
+        if footprint:
+            xs = [p[0] for p in footprint]
+            ys = [p[1] for p in footprint]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            margin = min(tile.xtile, tile.ytile) * 0.02
+            # lower-left corner of QR image
+            insert_x = max_x - margin - qr_size
+            insert_y = max_y - margin - qr_size
+            cx = insert_x + (qr_size / 2.0)
+            cy = insert_y + (qr_size / 2.0)
+        else:
+            cx = sum(v.x() for v in tile.corners_top_xyz) / num_pts
+            cy = sum(v.y() for v in tile.corners_top_xyz) / num_pts
 
         half = qr_size / 2.0
         was_texture_enabled = bool(glIsEnabled(GL_TEXTURE_2D))
@@ -1432,6 +1450,7 @@ class GLWidget(QOpenGLWidget):
         vertices.append(origin + QVector3D(0, 0, 0))
         for i in range(segments):
             angle = 2 * math.pi * i / segments
+           
             vertices.append(origin + QVector3D(radius * math.cos(angle), radius * math.sin(angle), height))
         for i in range(segments):
             angle = 2 * math.pi * i / segments
@@ -1527,7 +1546,7 @@ class GLWidget(QOpenGLWidget):
         except IOError as e:
             print(f"Error exporting OBJ file: {e}")
 
-    def export_scene_to_dxf_file(self, file_path):
+    def export_scene_to_dxf_file(self, file_path, qr_pct=0.10):
         import ezdxf
         try:
             doc = ezdxf.new(dxfversion="R2010")
@@ -1635,11 +1654,10 @@ class GLWidget(QOpenGLWidget):
                     size_in_pixel=img.size
                 )
 
-                # Compute QR size as 10% of tile footprint and place at top-right
+                # Compute QR size as user-selected percent of tile footprint and place at top-right
                 # with a small margin (5%) from tile edges to avoid overlap.
                 tile_w = (max_x - min_x) if (max_x is not None and min_x is not None) else getattr(tile, 'xtile', 0.0)
                 tile_h = (max_y - min_y) if (max_y is not None and min_y is not None) else getattr(tile, 'ytile', 0.0)
-                qr_pct = 0.10
                 margin_pct = 0.05
                 qr_w = tile_w * qr_pct
                 qr_h = tile_h * qr_pct
@@ -1770,6 +1788,24 @@ class MainWindow(QMainWindow):
         slope_f.addRow(self.import_elev_btn)
         slope_g.setLayout(slope_f); self.control_layout.addWidget(slope_g)
 
+
+        # QR Code Size Slider
+        qrsize_g = QGroupBox("QR Code Size")
+        qrsize_f = QFormLayout()
+        self.qrsize_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.qrsize_slider.setMinimum(0)
+        self.qrsize_slider.setMaximum(50)
+        self.qrsize_slider.setValue(10)
+        self.qrsize_slider.setTickInterval(1)
+        self.qrsize_slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
+        self.qrsize_label = QLabel("QR Size: 10% of tile")
+        self.qrsize_slider.valueChanged.connect(lambda v: self.qrsize_label.setText(f"QR Size: {v}% of tile"))
+        # Update visualization when slider changes
+        self.qrsize_slider.valueChanged.connect(self.on_qrsize_changed)
+        qrsize_f.addRow(self.qrsize_label, self.qrsize_slider)
+        qrsize_g.setLayout(qrsize_f)
+        self.control_layout.addWidget(qrsize_g)
+
         # Visualization toggles
         vis_g = QGroupBox("Visualization")
         vis_f = QFormLayout()
@@ -1817,6 +1853,20 @@ class MainWindow(QMainWindow):
 
         # Defer first visualization until after the window is shown to ensure a GL context
         QtCore.QTimer.singleShot(0, self.update_visualization)
+
+    def on_qrsize_changed(self, value):
+        # Update GL widget QR percent and clear cached QR textures so they are recreated
+        pct = max(0.0, min(1.0, value / 100.0))
+        self.gl_widget.qr_pct = pct
+        for t in self.gl_widget.tiles:
+            try:
+                if getattr(t, 'qr_texture_id', None):
+                    # mark for recreation; do not attempt to delete GL texture here (context may be different)
+                    t.qr_texture_id = None
+                t.qr_size = None
+            except Exception:
+                pass
+        self.gl_widget.update()
 
     def import_room_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import Room Polygon", "", "Text/CSV Files (*.txt *.csv);;All Files (*)")
@@ -1931,7 +1981,9 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self.gl_widget.export_scene_to_dxf_file(path)
+        # Get QR code size percent from slider
+        qr_pct = self.qrsize_slider.value() / 100.0
+        self.gl_widget.export_scene_to_dxf_file(path, qr_pct=qr_pct)
         QMessageBox.information(self, "Export Successful",
                                 f"DXF exported to:\n{path}")
 
