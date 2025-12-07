@@ -1,4 +1,4 @@
- def generate_qr_png(tile_id, tile_data, path, size=200):
+def generate_qr_png(tile_id, tile_data, path, size=200):
     """Generate a QR code with a simple, readable URL format.
 
     Args:
