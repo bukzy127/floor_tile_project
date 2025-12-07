@@ -1,16 +1,31 @@
-def generate_qr_png(label, path, size=200):
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=10,
-        border=2,
-    )
-    qr.add_data(str(label))
-    qr.make(fit=True)
+ def generate_qr_png(tile_id, tile_data, path, size=200):
+    """Generate a QR code with a simple, readable URL format.
 
-    img = qr.make_image(fill_color="black", back_color="white")
-    img = img.resize((size, size), Image.NEAREST)
-    img.save(path)
+    Args:
+        tile_id: Tile identifier (e.g., "T-0-10")
+        tile_data: Dict with tile properties
+        path: Output file path
+        size: Image size in pixels
+    """
+    # Create a simple, readable text URL
+    # Format: ID|Material|Thickness|Density|Weight|RValue
+    qr_text = f"{tile_id}|{tile_data.get('material', 'N/A')}|{tile_data.get('thickness', 'N/A')}|{tile_data.get('density', 'N/A')}|{tile_data.get('weight', 'N/A')}|{tile_data.get('thermal_r', 'N/A')}"
+
+    try:
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_H,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data(qr_text)
+        qr.make(fit=True)
+
+        img = qr.make_image(fill_color="black", back_color="white")
+        img = img.resize((size, size), Image.NEAREST)
+        img.save(path)
+    except Exception as e:
+        print(f"Warning: QR code generation failed for {tile_id}: {e}")
 import sys
 import math
 import json
@@ -265,16 +280,31 @@ class InfoDialog(QDialog):
 
         # Generate an inline QR image for the dialog (PIL -> QPixmap via bytes)
         try:
-            payload = str(tile.qr_data or "")
-            if not payload:
-                payload = "TILE"
+            tile_id = str(tile.qr_data or "TILE")
+            # Get tile data from parent window if available
+            tile_data = {
+                'material': 'Unknown',
+                'density': 0,
+                'weight': 0,
+                'thermal_r': 0,
+                'thickness': f"{tile.thickness*1000:.1f}mm" if tile.thickness else "N/A"
+            }
+            if parent and hasattr(parent, 'density_in'):
+                tile_data['material'] = parent.material_cb.currentText() if hasattr(parent, 'material_cb') else 'Tile'
+                tile_data['density'] = int(parent.density_in.value())
+                tile_data['weight'] = parent.weight_in.value()
+                tile_data['thermal_r'] = parent.thermal_r_in.value()
+
             qr = qrcode.QRCode(
-                version=1,
-                error_correction=qrcode.constants.ERROR_CORRECT_M,
+                version=None,
+                error_correction=qrcode.constants.ERROR_CORRECT_H,
                 box_size=6,
                 border=1,
             )
-            qr.add_data(payload)
+            # Create simple readable text format: ID|Material|Thickness|Density|Weight|RValue
+            qr_text = f"{tile_id}|{tile_data.get('material', 'N/A')}|{tile_data.get('thickness', 'N/A')}|{tile_data.get('density', 'N/A')}|{tile_data.get('weight', 'N/A')}|{tile_data.get('thermal_r', 'N/A')}"
+
+            qr.add_data(qr_text)
             qr.make(fit=True)
             qr_img = qr.make_image(fill_color="black", back_color="white")
             if hasattr(qr_img, 'get_image'):
@@ -367,7 +397,7 @@ class RoomInputHandler:
 class ElevationModel:
     """Supports flat, planar slope, and irregular map (IDW interpolation)"""
     def __init__(self):
-        self.mode = 'planar'  # 'flat'|'planar'|'irregular'
+        self.mode = 'flat'  # 'flat'|'planar'|'irregular'
         self.flat_z = 0.0
         self.base_z = 0.0
         self.slope_x = 0.0
@@ -421,6 +451,7 @@ class ElevationModel:
 # -----------------------------------------------------------------------------
 class GLWidget(QOpenGLWidget):
     tileClicked = QtCore.pyqtSignal(object)
+    pedestalClicked = QtCore.pyqtSignal(object)  # Signal for pedestal clicks
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -429,6 +460,7 @@ class GLWidget(QOpenGLWidget):
         self.original_floor_mesh = []
         self.setMouseTracking(True)
         self.selected_tile_index = -1
+        self.selected_pedestal_index = -1  # Track selected pedestal
 
         self.camera_azimuth = 45.0
         self.camera_elevation = 30.0
@@ -459,6 +491,11 @@ class GLWidget(QOpenGLWidget):
 
         self.qr_pct = 0.10  # Default QR code size percent
 
+        # Material texture support
+        self.material_texture_id = None
+        self.material_texture_path = None
+        self.material_texture_size = (0, 0)
+
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_COLOR_MATERIAL)
@@ -474,6 +511,80 @@ class GLWidget(QOpenGLWidget):
         glCullFace(GL_BACK)
         glClearColor(0.85, 0.85, 0.95, 1.0)
         self.unit_cylinder_dl = -1
+
+    def load_material_texture(self, image_path):
+        """Load a seamless material texture from PNG or JPG file."""
+        try:
+            # Open image with PIL
+            img = Image.open(image_path)
+            img = img.convert('RGB')  # Ensure RGB format
+
+            # Store original size for seamless tiling calculations
+            original_width, original_height = img.size
+
+            # Resize to power of 2 for better OpenGL compatibility (max 2048x2048)
+            max_size = 2048
+            if original_width > max_size or original_height > max_size:
+                scale_factor = min(max_size / original_width, max_size / original_height)
+                new_width = int(original_width * scale_factor)
+                new_height = int(original_height * scale_factor)
+                img = img.resize((new_width, new_height), Image.LANCZOS)
+
+            # Flip image for OpenGL coordinate system
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+            img_data = img.tobytes()
+            img_width, img_height = img.size
+
+            # Ensure OpenGL context is current
+            self.makeCurrent()
+
+            # Delete old texture if exists
+            if self.material_texture_id is not None:
+                try:
+                    glDeleteTextures([self.material_texture_id])
+                except:
+                    pass
+
+            # Generate new texture
+            texture_id = glGenTextures(1)
+            if isinstance(texture_id, (list, tuple)):
+                texture_id = texture_id[0]
+            texture_id = int(texture_id)
+
+            glBindTexture(GL_TEXTURE_2D, texture_id)
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+
+            # Use GL_REPEAT for seamless tiling
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+
+            # Use mipmaps for better quality at different scales
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+
+            # Upload texture data
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img_width, img_height,
+                        0, GL_RGB, GL_UNSIGNED_BYTE, img_data)
+
+            # Generate mipmaps for better performance
+            try:
+                from OpenGL.GL import glGenerateMipmap
+                glGenerateMipmap(GL_TEXTURE_2D)
+            except:
+                # Fallback for older OpenGL
+                pass
+
+            # Store texture info
+            self.material_texture_id = texture_id
+            self.material_texture_path = image_path
+            self.material_texture_size = (img_width, img_height)
+
+            self.doneCurrent()
+
+            return True, None
+
+        except Exception as e:
+            return False, str(e)
 
     def _update_camera_target(self, room_width, room_length, effective_tile_top_z):
         self.room_center_for_rotation = QVector3D(room_width / 2.0, room_length / 2.0, effective_tile_top_z / 2.0)
@@ -522,7 +633,8 @@ class GLWidget(QOpenGLWidget):
         # Draw room polygon boundary if available
         self.draw_room_boundary()
 
-        for ped in self.pedestals: self.draw_pedestal(ped)
+        for i, ped in enumerate(self.pedestals):
+            self.draw_pedestal(ped, is_selected=(i == self.selected_pedestal_index))
         if self.show_tiles:
             for i, t in enumerate(self.tiles):
                 self.draw_tile(t, is_selected=(i == self.selected_tile_index))
@@ -599,7 +711,7 @@ class GLWidget(QOpenGLWidget):
         rl_param = room_params_input.get('length', 0.0)
 
         # configure elevation model
-        elev_mode = room_params_input.get('elevation_mode', 'planar')
+        elev_mode = room_params_input.get('elevation_mode', 'flat')
         self.elevation_model.mode = elev_mode
         if elev_mode == 'flat':
             self.elevation_model.flat_z = room_params_input.get('flat_z', 0.0)
@@ -681,7 +793,7 @@ class GLWidget(QOpenGLWidget):
                     tile = Tile3D(origin_xy=(x_orig, y_orig), xtile=tile_params['width'], ytile=tile_params['length'], thickness=tile_params['thickness'], is_cut=is_cut, cut_polygon_xy=inter, qr_data=f"T-{i}-{j}")
                     tile.compute_3d_corners(actual_tile_bottom_z)
                     initial_tiles.append(tile)
-                
+
       # Characterize tiles so we can reduce pedestals under very small edge pieces
         full_tile_area = tile_params['width'] * tile_params['length']
         small_piece_threshold = full_tile_area * 0.25 if full_tile_area > 0 else 0.0
@@ -1000,14 +1112,56 @@ class GLWidget(QOpenGLWidget):
 
     def draw_tile(self, tile: Tile3D, is_selected=False):
         if not tile.corners_top_xyz: return
-        if is_selected: glColor3f(1.0, 0.7, 0.0)
-        elif tile.is_cut: glColor3f(0.65, 0.75, 0.9)
-        else: glColor3f(0.9, 0.9, 0.8)
 
-        # Top
-        glBegin(GL_POLYGON); glNormal3f(0,0,1)
-        for v in tile.corners_top_xyz: glVertex3f(v.x(), v.y(), v.z())
+        # Enable texture if material texture is loaded
+        texture_enabled = False
+        if self.material_texture_id is not None:
+            texture_enabled = True
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, self.material_texture_id)
+            glColor3f(1.0, 1.0, 1.0)  # White to show texture colors
+        else:
+            if is_selected: glColor3f(1.0, 0.7, 0.0)
+            elif tile.is_cut: glColor3f(0.65, 0.75, 0.9)
+            else: glColor3f(0.9, 0.9, 0.8)
+
+        # Get tile footprint for texture coordinate calculation
+        footprint = tile.get_actual_xy_footprint()
+        if footprint:
+            xs = [p[0] for p in footprint]
+            ys = [p[1] for p in footprint]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            tile_width = max_x - min_x
+            tile_height = max_y - min_y
+        else:
+            tile_width = tile.xtile
+            tile_height = tile.ytile
+            min_x = tile.origin_xy[0]
+            min_y = tile.origin_xy[1]
+
+        # Use physical dimensions for seamless tiling (texture repeats based on actual size)
+        # This ensures texture scale is consistent across all tiles
+        texture_scale = 1.0  # 1 texture repeat per meter
+
+        # Top face with texture coordinates
+        glBegin(GL_POLYGON)
+        glNormal3f(0, 0, 1)
+        for v in tile.corners_top_xyz:
+            if texture_enabled:
+                # Calculate texture coordinates based on world position for seamless tiling
+                tex_u = (v.x() - min_x) * texture_scale
+                tex_v = (v.y() - min_y) * texture_scale
+                glTexCoord2f(tex_u, tex_v)
+            glVertex3f(v.x(), v.y(), v.z())
         glEnd()
+
+        # Disable texture for bottom and sides (or apply differently if desired)
+        if texture_enabled:
+            glDisable(GL_TEXTURE_2D)
+            if is_selected: glColor3f(1.0, 0.7, 0.0)
+            elif tile.is_cut: glColor3f(0.65, 0.75, 0.9)
+            else: glColor3f(0.9, 0.9, 0.8)
 
         # Bottom
         glBegin(GL_POLYGON); glNormal3f(0,0,-1)
@@ -1049,19 +1203,35 @@ class GLWidget(QOpenGLWidget):
         if tile is None or getattr(tile, "qr_texture_id", None):
             return
 
-        payload = str(tile.qr_data or "")
-        if not payload:
+        tile_id = str(tile.qr_data or "")
+        if not tile_id:
             idx = self.tiles.index(tile) + 1 if tile in self.tiles else (id(tile) & 0xFFFF)
-            payload = f"TILE-{idx}"
+            tile_id = f"TILE-{idx}"
 
-        qr_code = qrcode.QRCode(
-            version=None,
-            error_correction=qrcode.constants.ERROR_CORRECT_M,
-            box_size=6,
-            border=1,
-        )
-        qr_code.add_data(payload)
-        qr_code.make(fit=True)
+        # Create tile data dict
+        tile_data = {
+            'material': 'Tile',
+            'density': 1900,
+            'weight': 15,
+            'thermal_r': 0.05,
+            'thickness': f"{tile.thickness*1000:.1f}mm" if tile.thickness else "N/A"
+        }
+
+        # Create simple readable text: ID|Material|Thickness|Density|Weight|RValue
+        qr_text = f"{tile_id}|{tile_data.get('material', 'N/A')}|{tile_data.get('thickness', 'N/A')}|{tile_data.get('density', 'N/A')}|{tile_data.get('weight', 'N/A')}|{tile_data.get('thermal_r', 'N/A')}"
+
+        try:
+            qr_code = qrcode.QRCode(
+                version=None,
+                error_correction=qrcode.constants.ERROR_CORRECT_H,
+                box_size=6,
+                border=1,
+            )
+            qr_code.add_data(qr_text)
+            qr_code.make(fit=True)
+        except Exception as e:
+            print(f"QR generation failed: {e}")
+            return
 
         qr_img = qr_code.make_image(fill_color="black", back_color="white")
         if hasattr(qr_img, "get_image"):
@@ -1217,7 +1387,7 @@ class GLWidget(QOpenGLWidget):
         glEndList()
         return dl
 
-    def draw_pedestal(self, pedestal):
+    def draw_pedestal(self, pedestal, is_selected=False):
         if self.unit_cylinder_dl == -1: self.unit_cylinder_dl = self.create_unit_cylinder_dl()
 
         glPushMatrix()
@@ -1228,20 +1398,32 @@ class GLWidget(QOpenGLWidget):
         BASE_R_S, STEM_R_S = 1.0, 0.7
 
         current_z = 0.0
-        # Draw Base
+        # Draw Base with selection highlight
         base_h, base_r = total_h * BASE_H_F, cap_r * BASE_R_S
         glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(base_r, base_r, base_h)
-        glColor3f(0.22, 0.22, 0.25); glCallList(self.unit_cylinder_dl); glPopMatrix()
+        if is_selected:
+            glColor3f(1.0, 0.7, 0.0)  # Orange highlight for selected
+        else:
+            glColor3f(0.22, 0.22, 0.25)
+        glCallList(self.unit_cylinder_dl); glPopMatrix()
         current_z += base_h
         # Draw Stem
         stem_h, stem_r = total_h * STEM_H_F, cap_r * STEM_R_S
         glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(stem_r, stem_r, stem_h)
-        glColor3f(0.28, 0.28, 0.31); glCallList(self.unit_cylinder_dl); glPopMatrix()
+        if is_selected:
+            glColor3f(1.0, 0.8, 0.1)  # Lighter orange for stem
+        else:
+            glColor3f(0.28, 0.28, 0.31)
+        glCallList(self.unit_cylinder_dl); glPopMatrix()
         current_z += stem_h
         # Draw Cap
         cap_h = total_h * CAP_H_F
         glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(cap_r, cap_r, cap_h)
-        glColor3f(0.35, 0.35, 0.38); glCallList(self.unit_cylinder_dl); glPopMatrix()
+        if is_selected:
+            glColor3f(1.0, 0.9, 0.2)  # Bright orange/yellow for cap
+        else:
+            glColor3f(0.35, 0.35, 0.38)
+        glCallList(self.unit_cylinder_dl); glPopMatrix()
 
         glPopMatrix()
 
@@ -1313,18 +1495,32 @@ class GLWidget(QOpenGLWidget):
     def mousePressEvent(self, event: QtGui.QMouseEvent):
         #self.last_mouse_pos = event.pos()
         self.last_mouse_pos = event.position()
-        if event.buttons() == QtCore.Qt.MouseButton.LeftButton:
-            prev_idx = self.selected_tile_index
-            self.selected_tile_index = -1
-            pixel_ratio = self.devicePixelRatioF()
-            tile_obj, tile_idx = self.pick_tile_accurate(
-                event.position().x() * pixel_ratio,
-                event.position().y() * pixel_ratio,
-            )
-            if tile_obj:
-                self.selected_tile_index = tile_idx
-                self.tileClicked.emit(tile_obj)
-            if prev_idx != self.selected_tile_index: self.update()
+        pixel_ratio = self.devicePixelRatioF()
+        screen_x = event.position().x() * pixel_ratio
+        screen_y = event.position().y() * pixel_ratio
+
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            # Try to pick pedestal first (pedestals are smaller, give priority)
+            ped_obj, ped_idx = self.pick_pedestal(screen_x, screen_y)
+            if ped_obj:
+                prev_ped_idx = self.selected_pedestal_index
+                self.selected_pedestal_index = ped_idx
+                self.selected_tile_index = -1  # Deselect tile
+                self.pedestalClicked.emit(ped_obj)
+                if prev_ped_idx != self.selected_pedestal_index:
+                    self.update()
+            else:
+                # No pedestal hit, try tile picking
+                prev_idx = self.selected_tile_index
+                prev_ped_idx = self.selected_pedestal_index
+                self.selected_tile_index = -1
+                self.selected_pedestal_index = -1
+                tile_obj, tile_idx = self.pick_tile_accurate(screen_x, screen_y)
+                if tile_obj:
+                    self.selected_tile_index = tile_idx
+                    self.tileClicked.emit(tile_obj)
+                if prev_idx != self.selected_tile_index or prev_ped_idx != -1:
+                    self.update()
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent):
         #dx = event.x() - self.last_mouse_pos.x(); dy = event.y() - self.last_mouse_pos.y()
@@ -1410,6 +1606,95 @@ class GLWidget(QOpenGLWidget):
                 closest_tile = tile
                 closest_index = idx
         return closest_tile, closest_index
+
+    def pick_pedestal(self, x_screen, y_screen):
+        """Pick a pedestal using ray-cylinder intersection.
+
+        Returns: (pedestal_dict, pedestal_index) or (None, -1) if no hit.
+        """
+        if self._cached_modelview is None or self._cached_projection is None or self._cached_viewport is None:
+            return None, -1
+
+        mvm = self._cached_modelview
+        pjm = self._cached_projection
+        vp = self._cached_viewport
+
+        # Clamp to viewport bounds
+        x_screen = max(vp[0], min(vp[0] + vp[2], x_screen))
+        y_screen = max(vp[1], min(vp[1] + vp[3], y_screen))
+
+        # Unproject to get ray
+        nx, ny, nz = gluUnProject(x_screen, vp[3] - y_screen, 0.0, mvm, pjm, vp)
+        fx, fy, fz = gluUnProject(x_screen, vp[3] - y_screen, 1.0, mvm, pjm, vp)
+        ray_origin = QVector3D(nx, ny, nz)
+        ray_dir = QVector3D(fx - nx, fy - ny, fz - nz).normalized()
+
+        closest_pedestal = None
+        closest_index = -1
+        min_t = float('inf')
+
+        # Test each pedestal as a cylinder
+        for idx, ped in enumerate(self.pedestals):
+            px, py = ped['pos_xy']
+            base_z = ped['base_z']
+            height = ped['height']
+            radius = ped['radius']
+
+            # Cylinder axis is vertical (along Z)
+            cyl_base = QVector3D(px, py, base_z)
+            cyl_top = QVector3D(px, py, base_z + height)
+            cyl_axis = QVector3D(0, 0, 1)  # Vertical
+
+            # Ray-cylinder intersection (infinite cylinder first)
+            # Using parametric form: P = ray_origin + t * ray_dir
+            # Cylinder: (P - cyl_base - ((P - cyl_base) · cyl_axis) * cyl_axis)² = radius²
+
+            # For vertical cylinder, simplify to 2D circle test in XY plane
+            ro_xy = QVector3D(ray_origin.x() - px, ray_origin.y() - py, 0)
+            rd_xy = QVector3D(ray_dir.x(), ray_dir.y(), 0)
+
+            # Quadratic equation: |ro_xy + t * rd_xy|² = radius²
+            a = rd_xy.lengthSquared()
+            b = 2.0 * QVector3D.dotProduct(ro_xy, rd_xy)
+            c = ro_xy.lengthSquared() - radius * radius
+
+            discriminant = b * b - 4.0 * a * c
+
+            if discriminant < 0 or abs(a) < EPSILON:
+                continue  # No intersection with infinite cylinder
+
+            # Find intersection points
+            sqrt_disc = math.sqrt(discriminant)
+            t1 = (-b - sqrt_disc) / (2.0 * a)
+            t2 = (-b + sqrt_disc) / (2.0 * a)
+
+            # Check both intersection points
+            for t in [t1, t2]:
+                if t < PICK_EPSILON or t >= min_t:
+                    continue
+
+                # Check if intersection point is within cylinder height
+                hit_point = ray_origin + ray_dir * t
+                if hit_point.z() >= base_z - PICK_EPSILON and hit_point.z() <= base_z + height + PICK_EPSILON:
+                    min_t = t
+                    closest_pedestal = ped
+                    closest_index = idx
+                    break
+
+        return closest_pedestal, closest_index
+
+    def get_pedestal_height_mm(self, pedestal):
+        """Calculate pedestal height in millimeters.
+
+        Args:
+            pedestal: Pedestal dictionary with 'height' key in meters
+
+        Returns:
+            float: Height in millimeters
+        """
+        if pedestal is None:
+            return 0.0
+        return pedestal.get('height', 0.0) * 1000.0  # Convert meters to mm
 
     # --- START: New/Modified methods for Exporting ---
 
@@ -1678,8 +1963,17 @@ class GLWidget(QOpenGLWidget):
                 label = str(tile.qr_data)
                 img_path = os.path.join(img_dir, f"{label}.png")
 
-                # Create the QR image file
-                generate_qr_png(label, img_path, size=250)
+                # Create tile data with material properties for QR code
+                tile_data = {
+                    'material': 'Tile',
+                    'density': 1900,
+                    'weight': 15,
+                    'thermal_r': 0.05,
+                    'thickness': f"{tile.thickness*1000:.1f}mm" if tile.thickness else "N/A"
+                }
+
+                # Create the QR image file with working data URL
+                generate_qr_png(label, tile_data, img_path, size=250)
 
                 # Register image definition
                 img = Image.open(img_path)
@@ -1763,6 +2057,13 @@ class GLWidget(QOpenGLWidget):
 
 # -----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
+    def on_visualization_toggle(self):
+        """Instantly update visualization toggles without recomputing layout."""
+        self.gl_widget.show_wireframe = self.wireframe_cb.isChecked()
+        self.gl_widget.show_elevation_map = self.elevmap_cb.isChecked()
+        self.gl_widget.show_tiles = self.showtiles_cb.isChecked()
+        self.gl_widget.update()
+
     def toggle_qr_visibility(self, state):
         self.gl_widget.show_qr_codes = bool(state)
         self.gl_widget.update()
@@ -1807,6 +2108,58 @@ class MainWindow(QMainWindow):
         tile_f.addRow("Width:",self.tw_in); tile_f.addRow("Length:",self.tl_in); tile_f.addRow("Thickness:",self.tt_in)
         tile_g.setLayout(tile_f); self.control_layout.addWidget(tile_g)
 
+        # Material Properties Group
+        material_g = QGroupBox("Material Properties")
+        material_f = QFormLayout()
+
+        # Material selector dropdown with default value set to "Tile"
+        self.material_cb = QtWidgets.QComboBox()
+        self.material_cb.addItems(["Stone", "Wood", "Tile", "Concrete", "Glass", "Gypsum board"])
+        self.material_cb.setCurrentIndex(2)  # Set "Tile" as default
+        self.material_cb.currentTextChanged.connect(self.on_material_changed)
+        material_f.addRow("Material:", self.material_cb)
+
+        # Import Material Texture Button
+        self.import_material_btn = QPushButton("Import Material Texture")
+        self.import_material_btn.clicked.connect(self.import_material_texture)
+        self.material_texture_label = QLabel("No texture loaded")
+        self.material_texture_label.setWordWrap(True)
+        self.material_texture_label.setStyleSheet("color: gray; font-size: 9pt;")
+        material_f.addRow(self.import_material_btn)
+        material_f.addRow("Texture:", self.material_texture_label)
+
+        # Material property input fields (all editable)
+        self.density_in = QDoubleSpinBox(minimum=0, maximum=10000, value=1900, decimals=1, singleStep=10)
+        self.weight_in = QDoubleSpinBox(minimum=0, maximum=500, value=15, decimals=2, singleStep=0.5)
+        self.thermal_r_in = QDoubleSpinBox(minimum=0, maximum=10, value=0.05, decimals=3, singleStep=0.01)
+
+        material_f.addRow("Density (kg/m³):", self.density_in)
+        material_f.addRow("Weight (kg/m²):", self.weight_in)
+        material_f.addRow("Thermal R-value (ft²·°F·h/Btu):", self.thermal_r_in)
+
+        # Store default values for each material (density, weight, thermal_r)
+        self.material_defaults = {
+            "Stone": {"density": 2600, "weight": 27, "thermal_r": 0.05},
+            "Wood": {"density": 650, "weight": 10, "thermal_r": 0.8},
+            "Tile": {"density": 1900, "weight": 15, "thermal_r": 0.05},
+            "Concrete": {"density": 2200, "weight": 110, "thermal_r": 0.4},
+            "Glass": {"density": 2500, "weight": 47, "thermal_r": 0.05},
+            "Gypsum board": {"density": 600, "weight": 6, "thermal_r": 0.3}
+        }
+
+        # Track which fields have been manually edited (to avoid overwriting user changes)
+        self.density_edited = False
+        self.weight_edited = False
+        self.thermal_r_edited = False
+
+        # Connect to valueChanged signals to track manual edits
+        self.density_in.valueChanged.connect(lambda: setattr(self, 'density_edited', True))
+        self.weight_in.valueChanged.connect(lambda: setattr(self, 'weight_edited', True))
+        self.thermal_r_in.valueChanged.connect(lambda: setattr(self, 'thermal_r_edited', True))
+
+        material_g.setLayout(material_f)
+        self.control_layout.addWidget(material_g)
+
         slope_g = QGroupBox("Original Subfloor Slope / Elevation")
         slope_f = QFormLayout()
         self.sbz_in=QDoubleSpinBox(minimum=-10,maximum=10,value=-0.05,decimals=3,singleStep=0.01)
@@ -1815,7 +2168,7 @@ class MainWindow(QMainWindow):
         slope_f.addRow("Base Z (at origin):",self.sbz_in)
         slope_f.addRow("Slope X (Z-change/m):",self.sx_in); slope_f.addRow("Slope Y (Z-change/m):",self.sy_in)
         # Elevation mode and import
-        self.elev_mode_cb = QtWidgets.QComboBox(); self.elev_mode_cb.addItems(["Planar", "Flat", "Irregular Map"])
+        self.elev_mode_cb = QtWidgets.QComboBox(); self.elev_mode_cb.addItems(["Flat", "Planar", "Irregular Map"])
         self.import_elev_btn = QPushButton("Import Elevation Map")
         self.import_elev_btn.clicked.connect(self.import_elevation_file)
         slope_f.addRow("Elevation Mode:", self.elev_mode_cb)
@@ -1849,6 +2202,10 @@ class MainWindow(QMainWindow):
         self.showtiles_cb.setChecked(True)
         self.showqr_cb = QtWidgets.QCheckBox("Show QR Codes")
         self.showqr_cb.setChecked(True)
+        # Connect visualization checkboxes to instant update (no recompute needed)
+        self.wireframe_cb.stateChanged.connect(self.on_visualization_toggle)
+        self.elevmap_cb.stateChanged.connect(self.on_visualization_toggle)
+        self.showtiles_cb.stateChanged.connect(self.on_visualization_toggle)
         self.showqr_cb.stateChanged.connect(self.toggle_qr_visibility)
         vis_f.addRow(self.wireframe_cb)
         vis_f.addRow(self.elevmap_cb)
@@ -1877,8 +2234,34 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidget(self.control_panel_widget)
 
         self.splitter.addWidget(self.scroll_area)
-        self.gl_widget = GLWidget(self); self.gl_widget.tileClicked.connect(self.show_tile_info_dialog)
-        self.splitter.addWidget(self.gl_widget)
+        self.gl_widget = GLWidget(self)
+        self.gl_widget.tileClicked.connect(self.show_tile_info_dialog)
+        self.gl_widget.pedestalClicked.connect(self.show_pedestal_height)
+
+        # Create a container for GL widget with overlay for pedestal height display
+        gl_container = QWidget()
+        gl_container_layout = QVBoxLayout(gl_container)
+        gl_container_layout.setContentsMargins(0, 0, 0, 0)
+        gl_container_layout.addWidget(self.gl_widget)
+
+        # Pedestal height display panel (floating overlay)
+        self.pedestal_height_panel = QLabel()
+        self.pedestal_height_panel.setStyleSheet("""
+            QLabel {
+                background-color: rgba(50, 50, 50, 220);
+                color: white;
+                padding: 12px 16px;
+                border-radius: 8px;
+                font-size: 14pt;
+                font-weight: bold;
+                border: 2px solid #FFA500;
+            }
+        """)
+        self.pedestal_height_panel.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.pedestal_height_panel.hide()
+        self.pedestal_height_panel.setParent(self.gl_widget)
+
+        self.splitter.addWidget(gl_container)
         self.splitter.setSizes([380, self.width() - 380])
         self.splitter.setStretchFactor(1, 1)
 
@@ -1887,6 +2270,32 @@ class MainWindow(QMainWindow):
 
         # Defer first visualization until after the window is shown to ensure a GL context
         QtCore.QTimer.singleShot(0, self.update_visualization)
+
+    def on_material_changed(self, material_name):
+        """Update material properties when material is selected from dropdown.
+        Only fills in values if they haven't been manually edited by the user."""
+        if material_name not in self.material_defaults:
+            return
+
+        defaults = self.material_defaults[material_name]
+
+        # Block signals temporarily to avoid triggering edited flags
+        self.density_in.blockSignals(True)
+        self.weight_in.blockSignals(True)
+        self.thermal_r_in.blockSignals(True)
+
+        # Only update if the field hasn't been manually edited
+        if not self.density_edited:
+            self.density_in.setValue(defaults["density"])
+        if not self.weight_edited:
+            self.weight_in.setValue(defaults["weight"])
+        if not self.thermal_r_edited:
+            self.thermal_r_in.setValue(defaults["thermal_r"])
+
+        # Re-enable signals
+        self.density_in.blockSignals(False)
+        self.weight_in.blockSignals(False)
+        self.thermal_r_in.blockSignals(False)
 
     def on_qrsize_changed(self, value):
         # Update GL widget QR percent and clear cached QR textures so they are recreated
@@ -1954,6 +2363,41 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.information(self, "Import Successful", f"Loaded elevation map with {len(self.gl_widget.elevation_model.points)} points")
 
+    def import_material_texture(self):
+        """Import a seamless material texture (PNG or JPG) and apply it to all tiles."""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Import Material Texture",
+            "",
+            "Image Files (*.png *.jpg *.jpeg);;PNG Files (*.png);;JPEG Files (*.jpg *.jpeg);;All Files (*)"
+        )
+        if not path:
+            return
+
+        # Load the texture into OpenGL
+        success, error = self.gl_widget.load_material_texture(path)
+
+        if not success:
+            QMessageBox.critical(self, "Import Error", f"Could not load texture:\n{error}")
+            return
+
+        # Update UI to show loaded texture
+        import os
+        filename = os.path.basename(path)
+        self.material_texture_label.setText(f"✓ {filename}")
+        self.material_texture_label.setStyleSheet("color: green; font-size: 9pt;")
+
+        # Update the 3D view to show the texture
+        self.gl_widget.update()
+
+        QMessageBox.information(
+            self,
+            "Texture Loaded",
+            f"Material texture loaded successfully!\n\n"
+            f"The texture will be applied to all tiles.\n"
+            f"Click 'Compute and Visualize Layout' to see the textured tiles."
+        )
+
     def get_parameters(self):
         # derive room mode
         rm_text = self.room_mode_cb.currentText()
@@ -1998,6 +2442,46 @@ class MainWindow(QMainWindow):
 
     def show_tile_info_dialog(self, tile: Tile3D):
         InfoDialog(tile, self).exec()
+
+    def show_pedestal_height(self, pedestal):
+        """Display the height of a clicked pedestal in a floating panel.
+
+        Args:
+            pedestal: Dictionary containing pedestal data including height
+        """
+        if pedestal is None:
+            self.pedestal_height_panel.hide()
+            return
+
+        # Get height in millimeters
+        height_mm = self.gl_widget.get_pedestal_height_mm(pedestal)
+        height_cm = height_mm / 10.0
+
+        # Get pedestal position for additional info
+        px, py = pedestal['pos_xy']
+        base_z_mm = pedestal['base_z'] * 1000.0
+
+        # Format the display text
+        display_text = f"Pedestal Height: {height_mm:.1f} mm ({height_cm:.1f} cm)"
+
+        # Update label
+        self.pedestal_height_panel.setText(display_text)
+        self.pedestal_height_panel.adjustSize()
+
+        # Position the panel at bottom-right of GL widget
+        gl_width = self.gl_widget.width()
+        gl_height = self.gl_widget.height()
+        panel_width = self.pedestal_height_panel.width()
+        panel_height = self.pedestal_height_panel.height()
+
+        # Place at bottom-right with margin
+        margin = 20
+        x_pos = gl_width - panel_width - margin
+        y_pos = gl_height - panel_height - margin
+
+        self.pedestal_height_panel.move(x_pos, y_pos)
+        self.pedestal_height_panel.show()
+        self.pedestal_height_panel.raise_()  # Bring to front
 
     # --- START: New methods for Exporting ---
     def export_scene_to_obj(self):
