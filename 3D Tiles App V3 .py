@@ -1871,49 +1871,55 @@ class GLWidget(QOpenGLWidget):
             doc = ezdxf.new(dxfversion="R2010")
             msp = doc.modelspace()
 
+            # Create separate layers for tiles and pedestals with distinct colors
+            if 'TILES' not in doc.layers:
+                doc.layers.new('TILES', dxfattribs={'color': 160})  # Gray for tiles
+            if 'PEDESTALS' not in doc.layers:
+                doc.layers.new('PEDESTALS', dxfattribs={'color': 3})  # Green for pedestals
+
             # -----------------------------------------
-            # 1. EXPORT TILES AS FULL 3D MESHES
+            # 1. EXPORT TILES AS CLEAN RECTANGLES
             # -----------------------------------------
-            for tile in self.tiles:
+            for tile_idx, tile in enumerate(self.tiles):
                 top = tile.corners_top_xyz
                 bottom = tile.corners_bottom_xyz
-                if not top or not bottom:
+                if not top or not bottom or len(top) < 3:
                     continue
 
-                # Top face triangulation
-                for i in range(len(top) - 2):
-                    msp.add_3dface([
-                        (top[0].x(), top[0].y(), top[0].z()),
-                        (top[i+1].x(), top[i+1].y(), top[i+1].z()),
-                        (top[i+2].x(), top[i+2].y(), top[i+2].z()),
-                    ], dxfattribs={'layer': 'TILES'})
-
-                # Bottom face
-                for i in range(len(bottom) - 2):
-                    msp.add_3dface([
-                        (bottom[0].x(), bottom[0].y(), bottom[0].z()),
-                        (bottom[i+1].x(), bottom[i+1].y(), bottom[i+1].z()),
-                        (bottom[i+2].x(), bottom[i+2].y(), bottom[i+2].z()),
-                    ], dxfattribs={'layer': 'TILES'})
-
+                # Add 3D faces without triangulation for clean appearance
+                # Top face as single polygon (no triangulation)
+                top_points = [(p.x(), p.y(), p.z()) for p in top]
+                msp.add_3dface(
+                    top_points,
+                    dxfattribs={'layer': 'TILES', 'color': 160}
+                )
+                
+                # Bottom face as single polygon (reversed)
+                bottom_points = [(p.x(), p.y(), p.z()) for p in reversed(bottom)]
+                msp.add_3dface(
+                    bottom_points,
+                    dxfattribs={'layer': 'TILES', 'color': 160}
+                )
+                
                 # Side faces
                 for i in range(len(top)):
                     p1t = top[i]
-                    p2t = top[(i+1) % len(top)]
+                    p2t = top[(i + 1) % len(top)]
                     p1b = bottom[i]
-                    p2b = bottom[(i+1) % len(bottom)]
-
-                    msp.add_3dface([
-                        (p1b.x(), p1b.y(), p1b.z()),
-                        (p2b.x(), p2b.y(), p2b.z()),
-                        (p2t.x(), p2t.y(), p2t.z()),
-                        (p1t.x(), p1t.y(), p1t.z()),
-                    ], dxfattribs={'layer': 'TILES'})
+                    p2b = bottom[(i + 1) % len(bottom)]
+                    
+                    msp.add_3dface(
+                        [(p1b.x(), p1b.y(), p1b.z()),
+                         (p2b.x(), p2b.y(), p2b.z()),
+                         (p2t.x(), p2t.y(), p2t.z()),
+                         (p1t.x(), p1t.y(), p1t.z())],
+                        dxfattribs={'layer': 'TILES', 'color': 160}
+                    )
 
             # -----------------------------------------
             # 2. EXPORT PEDESTALS AS 3D CYLINDERS
             # -----------------------------------------
-            for ped in self.pedestals:
+            for ped_idx, ped in enumerate(self.pedestals):
                 x, y = ped["pos_xy"]
                 z = ped["base_z"]
                 r = ped["radius"]
@@ -1931,79 +1937,103 @@ class GLWidget(QOpenGLWidget):
 
                     msp.add_3dface([
                         p1b, p2b, p2t, p1t
-                    ], dxfattribs={'layer': 'PEDESTALS'})
+                    ], dxfattribs={'layer': 'PEDESTALS', 'color': 3})
 
             # -----------------------------------------
             # 3. EXPORT REAL QR CODE IMAGES
             # -----------------------------------------
             import os
 
-            # Ensure QRCODES layer exists
+            # Ensure layers exist
             if 'QRCODES' not in doc.layers:
-                doc.layers.new('QRCODES', dxfattribs={'color': 3})
+                doc.layers.new('QRCODES', dxfattribs={'color': 253})
+            if 'ELEVATION_MAP' not in doc.layers:
+                doc.layers.new('ELEVATION_MAP', dxfattribs={'color': 7})
 
             # Output folder next to DXF file
             img_dir = os.path.join(os.path.dirname(file_path), "qr_images")
             os.makedirs(img_dir, exist_ok=True)
 
+            # -----------------------------------------
+            # 3. EXPORT ELEVATION MAP (if available)
+            # -----------------------------------------
+            if self.original_floor_mesh:
+                for quad in self.original_floor_mesh:
+                    if len(quad) >= 4:
+                        quad_points = [(v.x(), v.y(), v.z()) for v in quad]
+                        msp.add_3dface(
+                            quad_points,
+                            dxfattribs={'layer': 'ELEVATION_MAP', 'color': 7}
+                        )
+
+            # -----------------------------------------
+            # 4. EXPORT QR CODES
+            # -----------------------------------------
             for tile in self.tiles:
                 fp = tile.get_actual_xy_footprint()
                 if not fp:
                     continue
 
-                # Tile center
-                min_x = min(p[0] for p in fp)
-                max_x = max(p[0] for p in fp)
-                min_y = min(p[1] for p in fp)
-                max_y = max(p[1] for p in fp)
-                cx = (min_x + max_x) / 2
-                cy = (min_y + max_y) / 2
-                cz = tile.corners_top_xyz[0].z() + 0.01  # slightly above surface
+                try:
+                    # Tile bbox and top Z
+                    xs = [p[0] for p in fp]
+                    ys = [p[1] for p in fp]
+                    min_x, max_x = min(xs), max(xs)
+                    min_y, max_y = min(ys), max(ys)
+                    tile_w = max_x - min_x
+                    tile_h = max_y - min_y
+                    tile_top_z = tile.corners_top_xyz[0].z()
 
-                label = str(tile.qr_data)
-                img_path = os.path.join(img_dir, f"{label}.png")
+                    # QR sizing and placement - match draw_tile_qr logic
+                    qr_pct_size = getattr(self, "qr_pct", qr_pct if qr_pct is not None else 0.10)
+                    qr_size = min(tile_w, tile_h) * qr_pct_size
+                    margin = min(tile_w, tile_h) * 0.02
+                    
+                    # Position at top-right corner with margin (lower-left corner of QR image)
+                    insert_x = max_x - margin - qr_size
+                    insert_y = max_y - margin - qr_size
+                    cz = tile_top_z + 0.005
+                    insert = (insert_x, insert_y, cz)
 
-                # Create tile data with material properties for QR code
-                tile_data = {
-                    'material': 'Tile',
-                    'density': 1900,
-                    'weight': 15,
-                    'thermal_r': 0.05,
-                    'thickness': f"{tile.thickness*1000:.1f}mm" if tile.thickness else "N/A"
-                }
+                    label = str(tile.qr_data)
+                    img_path = os.path.join(img_dir, f"{label}.png")
 
-                # Create the QR image file with working data URL
-                generate_qr_png(label, tile_data, img_path, size=250)
+                    # Create tile data with material properties for QR code
+                    tile_data = {
+                        'material': 'Tile',
+                        'density': 1900,
+                        'weight': 15,
+                        'thermal_r': 0.05,
+                        'thickness': f"{tile.thickness*1000:.1f}mm" if tile.thickness else "N/A"
+                    }
 
-                # Register image definition
-                img = Image.open(img_path)
-                img_def = doc.add_image_def(
-                    filename=img_path,
-                    size_in_pixel=img.size
-                )
+                    # Generate QR PNG to disk and open for pixel size
+                    generate_qr_png(label, tile_data, img_path, size=250)
+                    img = Image.open(img_path)
+                    abs_img_path = os.path.abspath(img_path)
 
-                # Compute QR size as user-selected percent of tile footprint and place at top-right
-                # with a small margin (5%) from tile edges to avoid overlap.
-                tile_w = (max_x - min_x) if (max_x is not None and min_x is not None) else getattr(tile, 'xtile', 0.0)
-                tile_h = (max_y - min_y) if (max_y is not None and min_y is not None) else getattr(tile, 'ytile', 0.0)
-                margin_pct = 0.05
-                qr_w = tile_w * qr_pct
-                qr_h = tile_h * qr_pct
-                margin_x = tile_w * margin_pct
-                margin_y = tile_h * margin_pct
+                    # Register image definition (absolute path required by AutoCAD)
+                    img_def = doc.add_image_def(
+                        filename=abs_img_path,
+                        size_in_pixel=img.size,
+                    )
+                    print(f"[DXF] IMAGEDEF for {label}: handle={img_def.dxf.handle}, path={abs_img_path}")
 
-                # Insert point for image: lower-left corner of the QR image.
-                # Place QR in top-right of tile, offset by margin from the tile edge.
-                insert_x = cx + (tile_w / 2.0) - margin_x - qr_w
-                insert_y = cy + (tile_h / 2.0) - margin_y - qr_h
+                    # Add IMAGE entity to modelspace using official ezdxf signature
+                    img_entity = msp.add_image(
+                        image_def=img_def,
+                        insert=insert,
+                        size_in_units=(qr_size, qr_size),
+                        dxfattribs={"layer": "QRCODES"},
+                    )
+                    assert img_entity is not None
+                    print(f"[DXF] IMAGE for {label}: handle={img_entity.dxf.handle}, insert={insert}, size={qr_size}")
 
-                msp.add_image(
-                    img_def,
-                    (insert_x, insert_y, cz),
-                    (qr_w, qr_h),  # size_in_units: width, height in drawing units
-                    rotation=0,
-                    dxfattribs={'layer': 'QRCODES'}
-                )
+                except Exception as e:
+                    print(f"[DXF] ERROR exporting QR for tile {label}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
 
             # -----------------------------------------
             # Save output (robustly, handling permission errors)
