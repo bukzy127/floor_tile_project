@@ -484,14 +484,12 @@ class GLWidget(QOpenGLWidget):
         self.camera_azimuth = 45.0
         self.camera_elevation = 30.0
         self.camera_distance = 15.0
-        self.camera_target = QVector3D(0.0, 0.0, 0.0)
+        self.camera_target = QVector3D(0.05, 0.05, 0.0)
         #self.last_mouse_pos = QtCore.QPoint()
         self.last_mouse_pos = QtCore.QPointF()
-        # Start with no default room so the viewport is empty until the user computes a layout.
-        self.room_center_for_rotation = QVector3D(0.0, 0.0, 0.0)
+        self.room_center_for_rotation = QVector3D(0.05,0.05,0)
 
-        # Initialize room dimensions to zero to avoid drawing a small default square in the view.
-        self.room_dims = {'width': 0.0, 'length': 0.0, 'target_top_z': 0.0}
+        self.room_dims = {'width': 0.1, 'length': 0.1, 'target_top_z': 0.0}
         self.original_slope_func = lambda x, y: 0.0
         self.unit_cylinder_dl = -1
         # Cached GL transforms captured during paint to avoid GL calls in event handlers
@@ -507,7 +505,6 @@ class GLWidget(QOpenGLWidget):
         self.imported_mesh = None
         self.surface_selection_mode = False
         self.selected_surface = None
-        self.selected_surfaces = set()  # Multi-selection: set of face indices (highlighted in red)
         self.hovered_surface = None
         self.surface_selector = None  # Will be initialized when mesh is loaded
 
@@ -529,7 +526,6 @@ class GLWidget(QOpenGLWidget):
         self.imported_mesh = None
         self.surface_selection_mode = False
         self.selected_surface = None
-        self.selected_surfaces = set()  # Multi-selection: set of face indices (highlighted in red)
         self.hovered_surface = None
 
     def initializeGL(self):
@@ -736,304 +732,6 @@ class GLWidget(QOpenGLWidget):
                            attempt_pos[1] - dir_y * (ped_radius * 0.4))
 
         return (cx, cy)
-
-    def compute_layout_on_selected_surfaces(self, tile_params, pedestal_height=0.1016):
-        """
-        Generate tile layout and pedestals ONLY on user-selected surfaces from 3D model.
-
-        Args:
-            tile_params: Dict with 'width', 'length', 'thickness' in meters
-            pedestal_height: Height of pedestals in meters (default 4 inches = 0.1016m)
-
-        Returns:
-            bool: True if layout was generated successfully, False otherwise
-        """
-        # Validate that we have selected surfaces
-        if not self.selected_surfaces:
-            return False
-
-        if self.imported_mesh is None:
-            return False
-
-        mesh = self.imported_mesh
-
-        # Clear existing tiles and pedestals
-        self.tiles.clear()
-        self.pedestals.clear()
-        self.selected_tile_index = -1
-
-        tile_width = tile_params.get('width', 0.3048)   # Default 12 inches
-        tile_length = tile_params.get('length', 0.3048)  # Default 12 inches
-        tile_thickness = tile_params.get('thickness', 0.02)
-        pedestal_radius = 0.035  # Pedestal cap radius
-
-        all_tiles = []
-        all_pedestals = {}
-
-        # Group-based processing: convert selected face indices into logical surface groups
-        selector = getattr(self, 'surface_selector', None)
-        selected_faces = [f for f in self.selected_surfaces if f < len(mesh.faces)]
-
-        # Build mapping: group_id -> set of face indices
-        groups_map = {}
-        if selector is not None:
-            for f in selected_faces:
-                gid = selector.get_group_id_for_face(f)
-                if gid is None:
-                    # treat as singleton group
-                    key = f"_face_{f}"
-                    groups_map.setdefault(key, set()).add(f)
-                else:
-                    groups_map.setdefault(gid, set()).update(selector.get_group_faces(f))
-        else:
-            # Fallback: each face is its own group
-            for f in selected_faces:
-                groups_map.setdefault(f, set()).add(f)
-
-        # Process each logical group once
-        for gid, faces in groups_map.items():
-            faces = sorted(set(faces))
-            if not faces:
-                continue
-
-            # Collect unique vertex indices used by the group's faces
-            face_array = np.asarray(mesh.faces)
-            group_vids = np.unique(face_array[faces].flatten())
-            verts_coords = np.asarray(mesh.vertices)[group_vids]
-
-            # Compute group centroid and robust average normal
-            centroid = np.mean(verts_coords, axis=0)
-            if hasattr(mesh, 'face_normals') and mesh.face_normals is not None:
-                normals = np.asarray(mesh.face_normals)[faces]
-                normal = np.mean(normals, axis=0)
-                nlen = np.linalg.norm(normal)
-                if nlen > EPSILON:
-                    normal = normal / nlen
-                else:
-                    normal = np.array([0.0, 0.0, 1.0])
-            else:
-                # PCA normal fallback
-                cov = np.cov((verts_coords - centroid).T)
-                eigvals, eigvecs = np.linalg.eigh(cov)
-                normal = eigvecs[:, np.argmin(eigvals)]
-
-            # Determine a stable U axis: choose the longest edge among group's faces
-            longest = 0.0
-            u_axis = None
-            for fi in faces:
-                f = mesh.faces[fi]
-                for k in range(len(f)):
-                    a = np.asarray(mesh.vertices[int(f[k])])
-                    b = np.asarray(mesh.vertices[int(f[(k + 1) % len(f)])])
-                    edge = b - a
-                    l = np.linalg.norm(edge)
-                    if l > longest and l > EPSILON:
-                        longest = l
-                        u_axis = edge / l
-            if u_axis is None:
-                # fallback: any vector perpendicular to normal
-                u_axis = np.array([1.0, 0.0, 0.0])
-                if abs(np.dot(u_axis, normal)) > 0.9:
-                    u_axis = np.array([0.0, 1.0, 0.0])
-                # make perpendicular
-                u_axis = u_axis - normal * np.dot(u_axis, normal)
-                u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-12)
-
-            # V axis
-            v_axis = np.cross(normal, u_axis)
-            v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-12)
-
-            # Build boundary loop for the group by finding edges referenced only once in the group
-            edge_count = {}
-            edge_dir = {}
-            for fi in faces:
-                f = mesh.faces[fi]
-                for k in range(len(f)):
-                    a = int(f[k]); b = int(f[(k + 1) % len(f)])
-                    key = (min(a, b), max(a, b))
-                    edge_count[key] = edge_count.get(key, 0) + 1
-                    # store directed occurrence for orientation
-                    if key not in edge_dir:
-                        edge_dir[key] = (a, b)
-
-            boundary_edges = [edge_dir[k] for k, c in edge_count.items() if c == 1]
-            if not boundary_edges:
-                # Fallback: if no boundary edges (e.g., closed shell or fully internal region),
-                # create a projected convex hull from the group's vertex set in UV space.
-                # This produces a reasonable tiling boundary for enclosed planar regions.
-                # Project all group vertices into UV
-                all_vids = group_vids
-                pts_uv = []
-                for vid in all_vids:
-                    p3 = np.asarray(mesh.vertices[int(vid)])
-                    rel = p3 - centroid
-                    u = float(np.dot(rel, u_axis)); v = float(np.dot(rel, v_axis))
-                    pts_uv.append((u, v, int(vid)))
-
-                # Monotone chain convex hull on 2D (u,v)
-                def _convex_hull_2d(points):
-                    pts = sorted(points, key=lambda x: (x[0], x[1]))
-                    if len(pts) <= 2:
-                        return [p[2] for p in pts]
-                    def cross(o, a, b):
-                        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
-                    lower = []
-                    for p in pts:
-                        while len(lower) >= 2 and cross((lower[-2][0], lower[-2][1]), (lower[-1][0], lower[-1][1]), (p[0], p[1])) <= 0:
-                            lower.pop()
-                        lower.append(p)
-                    upper = []
-                    for p in reversed(pts):
-                        while len(upper) >= 2 and cross((upper[-2][0], upper[-2][1]), (upper[-1][0], upper[-1][1]), (p[0], p[1])) <= 0:
-                            upper.pop()
-                        upper.append(p)
-                    hull = lower[:-1] + upper[:-1]
-                    return [p[2] for p in hull]
-
-                hull_vids = _convex_hull_2d(pts_uv)
-                if not hull_vids or len(hull_vids) < 3:
-                    # still nothing to tile
-                    continue
-                # Build ordered loop from hull_vids
-                loop = hull_vids
-            else:
-                # Build undirected adjacency of boundary vertices and walk to form ordered loop
-                b_adj = {}
-                for a, b in boundary_edges:
-                    b_adj.setdefault(a, []).append(b)
-                    b_adj.setdefault(b, []).append(a)
-
-                # pick start: prefer a vertex with degree 1 (open boundary), otherwise arbitrary
-                start = None
-                for v, nbrs in b_adj.items():
-                    if len(nbrs) == 1:
-                        start = v; break
-                if start is None:
-                    start = boundary_edges[0][0]
-
-                loop = []
-                used_vertices = set()
-                prev = None
-                cur = start
-                while True:
-                    loop.append(cur)
-                    used_vertices.add(cur)
-                    nbrs = b_adj.get(cur, [])
-                    nxt = None
-                    for n in nbrs:
-                        if n == prev:
-                            continue
-                        nxt = n; break
-                    prev = cur
-                    if nxt is None:
-                        break
-                    cur = nxt
-                    if cur == start:
-                        break
-
-            if len(loop) < 3:
-                continue
-
-            # Project loop vertices to UV coordinates
-            vertices_2d = []
-            loop_coords_3d = [np.asarray(mesh.vertices[int(vid)]) for vid in loop]
-            for p in loop_coords_3d:
-                rel = p - centroid
-                u = float(np.dot(rel, u_axis))
-                v = float(np.dot(rel, v_axis))
-                vertices_2d.append((u, v))
-
-            # Determine bounds and grid in UV space
-            us = [p[0] for p in vertices_2d]
-            vs = [p[1] for p in vertices_2d]
-            min_u, max_u = min(us), max(us)
-            min_v, max_v = min(vs), max(vs)
-
-            surface_width = max_u - min_u
-            surface_height = max_v - min_v
-
-            num_tiles_u = max(1, int(np.ceil(surface_width / tile_width)))
-            num_tiles_v = max(1, int(np.ceil(surface_height / tile_length)))
-
-            for iu in range(num_tiles_u):
-                for jv in range(num_tiles_v):
-                    tile_u = min_u + iu * tile_width
-                    tile_v = min_v + jv * tile_length
-                    tile_rect = [
-                        (tile_u, tile_v),
-                        (tile_u + tile_width, tile_v),
-                        (tile_u + tile_width, tile_v + tile_length),
-                        (tile_u, tile_v + tile_length)
-                    ]
-                    clipped = sutherland_hodgman_clip(vertices_2d, tile_rect)
-                    if not clipped or polygon_area_2d(clipped) < (tile_width * tile_length) * 0.01:
-                        continue
-
-                    # Convert clipped polygon back to 3D world coordinates
-                    polygon_3d = []
-                    for uv in clipped:
-                        world_pos = centroid + uv[0] * u_axis + uv[1] * v_axis
-                        polygon_3d.append((float(world_pos[0]), float(world_pos[1]), float(world_pos[2])))
-
-                    footprint_xy = [(p[0], p[1]) for p in polygon_3d]
-                    is_cut = abs(polygon_area_2d(clipped) - (tile_width * tile_length)) > EPSILON
-
-                    tile = Tile3D(
-                        origin_xy=(tile_u, tile_v),
-                        xtile=tile_width,
-                        ytile=tile_length,
-                        thickness=tile_thickness,
-                        is_cut=is_cut,
-                        cut_polygon_xy=footprint_xy,
-                        qr_data=f"T-{gid}-{iu}-{jv}"
-                    )
-
-                    base_z = min(p[2] for p in polygon_3d)
-                    tile_bottom_z = base_z + pedestal_height
-                    tile.corners_bottom_xyz = []
-                    tile.corners_top_xyz = []
-                    for p in polygon_3d:
-                        tile.corners_bottom_xyz.append(QVector3D(p[0], p[1], tile_bottom_z))
-                        tile.corners_top_xyz.append(QVector3D(p[0], p[1], tile_bottom_z + tile_thickness))
-                    tile.prepare_pick_geometry()
-
-                    all_tiles.append(tile)
-                    for px, py, pz in polygon_3d:
-                        key = (round(px, 4), round(py, 4))
-                        if key not in all_pedestals:
-                            all_pedestals[key] = {
-                                'pos_xy': (px, py),
-                                'base_z': pz,
-                                'height': pedestal_height,
-                                'radius': pedestal_radius
-                            }
-
-        # Store generated tiles and pedestals
-        self.tiles = all_tiles
-        self.pedestals = list(all_pedestals.values())
-
-        # Update room dimensions for camera
-        if all_tiles:
-            all_x = []
-            all_y = []
-            all_z = []
-            for tile in all_tiles:
-                for corner in tile.corners_top_xyz:
-                    all_x.append(corner.x())
-                    all_y.append(corner.y())
-                    all_z.append(corner.z())
-
-            if all_x:
-                width = max(all_x) - min(all_x)
-                length = max(all_y) - min(all_y)
-                center_x = (max(all_x) + min(all_x)) / 2
-                center_y = (max(all_y) + min(all_y)) / 2
-                center_z = (max(all_z) + min(all_z)) / 2
-
-                self.room_dims = {'width': width, 'length': length, 'target_top_z': max(all_z)}
-                self._update_camera_target(width, length, max(all_z))
-
-        return True
 
     def compute_and_build_layout(self, room_params_input, tile_params, slope_params):
         """Main layout algorithm updated to support polygonal rooms and irregular elevation models.
@@ -1349,7 +1047,9 @@ class GLWidget(QOpenGLWidget):
                     # average height + base_z for consistency
                     cluster["base_z"] = (cluster["base_z"] + ped["base_z"]) / 2.0
                     cluster["height"] = (cluster["height"] + ped["height"]) / 2.0
-                    cluster["tiles"] = list(dict.fromkeys(cluster.get("tiles", []) + ped.get("tiles", [])))
+                    combined_tiles = list(dict.fromkeys(cluster.get("tiles", []) + ped.get("tiles", [])))
+                    if combined_tiles:
+                        cluster["tiles"] = combined_tiles
 
                     placed = True
                     break
@@ -1435,33 +1135,18 @@ class GLWidget(QOpenGLWidget):
                 self.tiles.append(tile)
 
         # Generate floor mesh for drawing (same as before but use elevation model z)
-        # Only generate a floor mesh if the room has non-zero dimensions.
         floor_segments = 40
-        self.original_floor_mesh = []
-        if rw_param > EPSILON and rl_param > EPSILON and floor_segments > 0:
-            w_step = rw_param / floor_segments
-            l_step = rl_param / floor_segments
-            for i in range(floor_segments):
-                for j in range(floor_segments):
-                    x0 = origin_x + i * w_step
-                    y0 = origin_y + j * l_step
-                    x1 = origin_x + (i + 1) * w_step
-                    y1 = origin_y + (j + 1) * l_step
-                    p1 = QVector3D(x0, y0, self.original_slope_func(x0, y0))
-                    p2 = QVector3D(x1, y0, self.original_slope_func(x1, y0))
-                    p3 = QVector3D(x1, y1, self.original_slope_func(x1, y1))
-                    p4 = QVector3D(x0, y1, self.original_slope_func(x0, y1))
-                    self.original_floor_mesh.append([p1, p2, p3, p4])
-        else:
-            # No room defined - leave floor mesh empty so no default square appears.
-            self.original_floor_mesh = []
-
-        # Debug: report floor mesh size to confirm default square removal
-        try:
-            print(f"[DEBUG] compute_and_build_layout: original_floor_mesh quads = {len(self.original_floor_mesh)}")
-            sys.stdout.flush()
-        except Exception:
-            pass
+        w_step = rw_param / floor_segments if floor_segments>0 else rw_param
+        l_step = rl_param / floor_segments if floor_segments>0 else rl_param
+        for i in range(floor_segments):
+            for j in range(floor_segments):
+                x0, y0 = origin_x + i * w_step, origin_y + j * l_step
+                x1, y1 = origin_x + (i + 1) * w_step, origin_y + (j + 1) * l_step
+                p1 = QVector3D(x0, y0, self.original_slope_func(x0, y0))
+                p2 = QVector3D(x1, y0, self.original_slope_func(x1, y0))
+                p3 = QVector3D(x1, y1, self.original_slope_func(x1, y1))
+                p4 = QVector3D(x0, y1, self.original_slope_func(x0, y1))
+                self.original_floor_mesh.append([p1, p2, p3, p4])
 
         self.update()
 
@@ -1801,21 +1486,87 @@ class GLWidget(QOpenGLWidget):
         if not zs: return
         zmin, zmax = min(zs), max(zs)
         rng = max(zmax - zmin, 1e-6)
+    def draw_imported_mesh(self):
+        """Draw the imported 3D model mesh with surface selection highlighting - OPTIMIZED."""
+        if self.imported_mesh is None:
+            return
 
-        # Draw heatmap quads
-        for quad in self.original_floor_mesh:
-            avg_z = sum(v.z() for v in quad) / 4.0
-            t = (avg_z - zmin) / rng
-            # Color gradient: blue (low) -> green -> red (high)
-            if t < 0.5:
-                r, g, b = 0, t * 2, 1 - t * 2
-            else:
-                r, g, b = (t - 0.5) * 2, 1 - (t - 0.5) * 2, 0
-            glColor3f(r, g, b)
-            glBegin(GL_QUADS)
-            for v in quad:
-                glVertex3f(v.x(), v.y(), v.z())
+        mesh = self.imported_mesh
+
+        # For large meshes, use simplified rendering
+        use_simplified = len(mesh.faces) > 10000
+
+        glEnable(GL_LIGHTING)
+        glEnable(GL_COLOR_MATERIAL)
+
+        if use_simplified:
+            # Fast rendering: draw entire mesh as one color with wireframe
+            glColor3f(0.7, 0.7, 0.8)  # Default gray-blue
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)  # Wireframe mode
+            glLineWidth(1.0)
+
+        # Draw the mesh efficiently
+        glBegin(GL_TRIANGLES)
+
+        if use_simplified:
+            # Simplified: only draw geometry, no per-face color checks
+            for face_idx, face in enumerate(mesh.faces):
+                if hasattr(mesh, 'face_normals'):
+                    normal = mesh.face_normals[face_idx]
+                    glNormal3f(normal[0], normal[1], normal[2])
+
+                for vertex_idx in face:
+                    vertex = mesh.vertices[vertex_idx]
+                    glVertex3f(vertex[0], vertex[1], vertex[2])
+        else:
+            # Full rendering with selection highlighting
+            for face_idx, face in enumerate(mesh.faces):
+                # Check if this face is selected or hovered
+                is_selected = (self.selected_surface is not None and
+                              self.selected_surface == face_idx)
+                is_hovered = (self.hovered_surface is not None and
+                             self.hovered_surface == face_idx and
+                             self.surface_selection_mode)
+
+                # Set color based on state
+                if is_selected:
+                    glColor3f(0.2, 0.8, 0.2)  # Green for selected
+                elif is_hovered:
+                    glColor3f(1.0, 1.0, 0.0)  # Yellow for hovered
+                else:
+                    glColor3f(0.7, 0.7, 0.8)  # Default gray-blue
+
+                # Calculate normal for lighting
+                if hasattr(mesh, 'face_normals'):
+                    normal = mesh.face_normals[face_idx]
+                    glNormal3f(normal[0], normal[1], normal[2])
+
+                # Draw the triangle face
+                for vertex_idx in face:
+                    vertex = mesh.vertices[vertex_idx]
+                    glVertex3f(vertex[0], vertex[1], vertex[2])
+
+        glEnd()
+
+        # Reset polygon mode if simplified
+        if use_simplified:
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+
+        # Draw wireframe for selected surface (always visible)
+        if self.selected_surface is not None and self.selected_surface < len(mesh.faces):
+            glDisable(GL_LIGHTING)
+            glLineWidth(4.0)
+            glColor3f(1.0, 0.8, 0.0)  # Orange wireframe for visibility
+
+            face = mesh.faces[self.selected_surface]
+            glBegin(GL_LINE_LOOP)
+            for vertex_idx in face:
+                vertex = mesh.vertices[vertex_idx]
+                glVertex3f(vertex[0], vertex[1], vertex[2])
             glEnd()
+
+            glEnable(GL_LIGHTING)
+            glLineWidth(1.0)
 
     def draw_room_boundary(self):
         if not self.room_polygon_xy or len(self.room_polygon_xy) < 3: return
@@ -1863,19 +1614,16 @@ class GLWidget(QOpenGLWidget):
         else:
             # Full rendering with selection highlighting
             for face_idx, face in enumerate(mesh.faces):
-                # Check if this face is in multi-selection set (red), single-selected (green), or hovered (yellow)
-                is_multi_selected = face_idx in self.selected_surfaces
+                # Check if this face is selected or hovered
                 is_selected = (self.selected_surface is not None and
                               self.selected_surface == face_idx)
                 is_hovered = (self.hovered_surface is not None and
                              self.hovered_surface == face_idx and
                              self.surface_selection_mode)
 
-                # Set color based on state (priority: multi-selected > single-selected > hovered > default)
-                if is_multi_selected:
-                    glColor3f(0.9, 0.2, 0.2)  # Red for multi-selected surfaces
-                elif is_selected:
-                    glColor3f(0.2, 0.8, 0.2)  # Green for single-selected
+                # Set color based on state
+                if is_selected:
+                    glColor3f(0.2, 0.8, 0.2)  # Green for selected
                 elif is_hovered:
                     glColor3f(1.0, 1.0, 0.0)  # Yellow for hovered
                 else:
@@ -1897,23 +1645,7 @@ class GLWidget(QOpenGLWidget):
         if use_simplified:
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 
-        # Draw wireframe for all multi-selected surfaces (red outline)
-        if self.selected_surfaces:
-            glDisable(GL_LIGHTING)
-            glLineWidth(3.0)
-            glColor3f(1.0, 0.3, 0.3)  # Red wireframe for multi-selected
-            for surf_idx in self.selected_surfaces:
-                if surf_idx < len(mesh.faces):
-                    face = mesh.faces[surf_idx]
-                    glBegin(GL_LINE_LOOP)
-                    for vertex_idx in face:
-                        vertex = mesh.vertices[vertex_idx]
-                        glVertex3f(vertex[0], vertex[1], vertex[2])
-                    glEnd()
-            glEnable(GL_LIGHTING)
-            glLineWidth(1.0)
-
-        # Draw wireframe for single-selected surface (always visible)
+        # Draw wireframe for selected surface (always visible)
         if self.selected_surface is not None and self.selected_surface < len(mesh.faces):
             glDisable(GL_LIGHTING)
             glLineWidth(4.0)
@@ -1963,37 +1695,12 @@ class GLWidget(QOpenGLWidget):
             if self.surface_selection_mode and self.imported_mesh is not None:
                 surface_idx = self.pick_surface(screen_x, screen_y)
                 if surface_idx is not None:
-                    # Check for Ctrl modifier for multi-selection
-                    ctrl_held = event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier
+                    self.selected_surface = surface_idx
+                    self.surface_selection_mode = False
 
-                    # Determine the full coplanar group for the picked face (if selector available)
-                    if hasattr(self, 'surface_selector') and self.surface_selector is not None:
-                        try:
-                            group_faces = set(self.surface_selector.get_group_faces(surface_idx))
-                        except Exception:
-                            group_faces = {surface_idx}
-                    else:
-                        group_faces = {surface_idx}
-
-                    if ctrl_held:
-                        # Multi-select toggle: add/remove the entire group
-                        if group_faces.issubset(self.selected_surfaces):
-                            self.selected_surfaces.difference_update(group_faces)
-                        else:
-                            self.selected_surfaces.update(group_faces)
-                        # Keep selection mode active for more picks
-                        if hasattr(self.parent(), 'update_selection_info'):
-                            self.parent().update_selection_info()
-                    else:
-                        # Single-select: replace selection with the group and exit selection mode
-                        self.selected_surfaces.clear()
-                        self.selected_surfaces.update(group_faces)
-                        self.selected_surface = surface_idx
-                        self.surface_selection_mode = False
-
-                        # Extract surface dimensions and update parent window (pass the picked face)
-                        if hasattr(self.parent(), 'on_surface_selected'):
-                            self.parent().on_surface_selected(surface_idx)
+                    # Extract surface dimensions and update parent window
+                    if hasattr(self.parent(), 'on_surface_selected'):
+                        self.parent().on_surface_selected(surface_idx)
 
                     self.update()
                 return
@@ -2255,6 +1962,73 @@ class GLWidget(QOpenGLWidget):
                     break
 
         return closest_pedestal, closest_index
+
+    def pick_surface(self, x_screen, y_screen):
+        """Pick a surface from the imported 3D mesh using ray-triangle intersection.
+
+        Returns: face_index or None if no hit.
+        """
+        if self.imported_mesh is None:
+            return None
+
+        if self._cached_modelview is None or self._cached_projection is None or self._cached_viewport is None:
+            return None
+
+        mvm = self._cached_modelview
+        pjm = self._cached_projection
+        vp = self._cached_viewport
+
+        # Clamp to viewport bounds
+        x_screen = max(vp[0], min(vp[0] + vp[2], x_screen))
+        y_screen = max(vp[1], min(vp[1] + vp[3], y_screen))
+
+        # Unproject to get ray
+        nx, ny, nz = gluUnProject(x_screen, vp[3] - y_screen, 0.0, mvm, pjm, vp)
+        fx, fy, fz = gluUnProject(x_screen, vp[3] - y_screen, 1.0, mvm, pjm, vp)
+        ray_origin = np.array([nx, ny, nz])
+        ray_dir = np.array([fx - nx, fy - ny, fz - nz])
+        ray_dir = ray_dir / np.linalg.norm(ray_dir)
+
+        closest_face = None
+        min_t = float('inf')
+
+        # Test each triangle face
+        mesh = self.imported_mesh
+        for face_idx, face in enumerate(mesh.faces):
+            v0 = mesh.vertices[face[0]]
+            v1 = mesh.vertices[face[1]]
+            v2 = mesh.vertices[face[2]]
+
+            # Möller–Trumbore ray-triangle intersection algorithm
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            h = np.cross(ray_dir, edge2)
+            a = np.dot(edge1, h)
+
+            if abs(a) < EPSILON:
+                continue  # Ray parallel to triangle
+
+            f = 1.0 / a
+            s = ray_origin - v0
+            u = f * np.dot(s, h)
+
+            if u < 0.0 or u > 1.0:
+                continue
+
+            q = np.cross(s, edge1)
+            v = f * np.dot(ray_dir, q)
+
+            if v < 0.0 or u + v > 1.0:
+                continue
+
+            # Compute t to find intersection point
+            t = f * np.dot(edge2, q)
+
+            if t > PICK_EPSILON and t < min_t:
+                min_t = t
+                closest_face = face_idx
+
+        return closest_face
 
     def get_pedestal_height_mm(self, pedestal):
         """Calculate pedestal height in millimeters.
@@ -2674,25 +2448,22 @@ class MainWindow(QMainWindow):
         self.select_surface_btn = QPushButton("Select Surface for Tiling")
         self.select_surface_btn.clicked.connect(self.activate_surface_selection)
         self.select_surface_btn.hide()
-        self.clear_selection_btn = QPushButton("Clear Selection")
-        self.clear_selection_btn.clicked.connect(self.clear_surface_selection)
-        self.clear_selection_btn.hide()
         self.surface_info_label = QLabel("No surface selected")
         self.surface_info_label.setStyleSheet("color: gray; font-size: 9pt;")
         self.surface_info_label.hide()
 
         room_mode_f.addRow(self.import_3d_model_btn)
         room_mode_f.addRow("Model:", self.model_status_label)
-        room_mode_f.addRow(self.select_surface_btn, self.clear_selection_btn)
+        room_mode_f.addRow(self.select_surface_btn)
         room_mode_f.addRow("Surface:", self.surface_info_label)
 
         room_mode_g.setLayout(room_mode_f); self.control_layout.addWidget(room_mode_g)
 
         room_g = QGroupBox("Room Dimensions (meters)")
         room_f = QFormLayout()
-        self.rw_in=QDoubleSpinBox(minimum=0.0,maximum=100,value=0.0,decimals=2,singleStep=0.1)
-        self.rl_in=QDoubleSpinBox(minimum=0.0,maximum=100,value=0.0,decimals=2,singleStep=0.1)
-        self.r_ttz_in=QDoubleSpinBox(minimum=-10,maximum=10,value=0.0,decimals=2,singleStep=0.05)
+        self.rw_in=QDoubleSpinBox(minimum=0.1,maximum=100,value=5.0,decimals=2,singleStep=0.1)
+        self.rl_in=QDoubleSpinBox(minimum=0.1,maximum=100,value=4.0,decimals=2,singleStep=0.1)
+        self.r_ttz_in=QDoubleSpinBox(minimum=-10,maximum=10,value=0.15,decimals=2,singleStep=0.05)
         room_f.addRow("Width:",self.rw_in); room_f.addRow("Length:",self.rl_in)
         room_f.addRow("Target Tile Top Z:", self.r_ttz_in)
         room_g.setLayout(room_f); self.control_layout.addWidget(room_g)
@@ -2745,13 +2516,11 @@ class MainWindow(QMainWindow):
         }
 
         # Track which fields have been manually edited
-        self.material_edited = False
         self.density_edited = False
         self.weight_edited = False
         self.thermal_r_edited = False
 
         # Connect to valueChanged signals to track manual edits
-        self.material_cb.currentTextChanged.connect(lambda: setattr(self, 'material_edited', True))
         self.density_in.valueChanged.connect(lambda: setattr(self, 'density_edited', True))
         self.weight_in.valueChanged.connect(lambda: setattr(self, 'weight_edited', True))
         self.thermal_r_in.valueChanged.connect(lambda: setattr(self, 'thermal_r_edited', True))
@@ -2880,7 +2649,6 @@ class MainWindow(QMainWindow):
         self.import_3d_model_btn.hide()
         self.model_status_label.hide()
         self.select_surface_btn.hide()
-        self.clear_selection_btn.hide()
         self.surface_info_label.hide()
 
         # Show relevant controls based on mode
@@ -2894,58 +2662,16 @@ class MainWindow(QMainWindow):
             self.import_3d_model_btn.show()
             self.model_status_label.show()
             self.select_surface_btn.show()
-            self.clear_selection_btn.show()
             self.surface_info_label.show()
 
-    def export_scene_to_obj(self):
-        """Save scene to an OBJ file using the GL widget exporter."""
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Scene to OBJ", "", "OBJ Files (*.obj);;All Files (*)")
-        if not path:
-            return
-        try:
-            self.gl_widget.export_scene_to_obj_file(path)
-            QMessageBox.information(self, "Export Complete", f"OBJ exported to: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Failed to export OBJ:\n{e}")
-
-    def export_layout_report(self):
-        """Write the current generated layout report to a text file."""
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Layout Report", "", "Text Files (*.txt);;All Files (*)")
-        if not path:
-            return
-        try:
-            report = self.gl_widget.generate_layout_report_string()
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(report)
-            QMessageBox.information(self, "Report Saved", f"Layout report saved to: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Save Failed", f"Failed to save report:\n{e}")
-
-    def export_scene_to_dxf(self):
-        """Save scene to a DXF file using the GL widget exporter."""
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Scene to DXF", "", "DXF Files (*.dxf);;All Files (*)")
-        if not path:
-            return
-        try:
-            self.gl_widget.export_scene_to_dxf_file(path, qr_pct=getattr(self.gl_widget, 'qr_pct', 0.10))
-            QMessageBox.information(self, "Export Complete", f"DXF exported to: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Failed to export DXF:\n{e}")
-
     def import_3d_model(self):
-        """Import a 3D model file (.obj, .dwg, .dxf, .skp) using unified model_loader."""
-        if not MODEL_IMPORT_AVAILABLE:
+        """Import a 3D model file (.obj, .dwg, .dxf, .skp) for surface selection."""
+        if trimesh is None:
             QMessageBox.critical(
                 self,
-                "Model Import Unavailable",
-                "3D model import modules are not available.\n\n"
-                "Required libraries:\n"
-                "• trimesh - for mesh loading\n"
-                "• ezdxf - for DWG/DXF files\n\n"
-                "Install with:\n"
-                "pip install trimesh ezdxf\n\n"
-                "For SketchUp support, also install:\n"
-                "pip install trimesh[easy]"
+                "Missing Library",
+                "The 'trimesh' library is required for 3D model import.\n\n"
+                "Please install it with:\npip install trimesh"
             )
             return
 
@@ -2959,25 +2685,86 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # Use unified model loader from model_loader.py
-            mesh = load_model(path)
+            # Load the mesh using trimesh with format-specific handling
+            file_ext = path.lower().split('.')[-1]
 
-            # Normalize units (convert mm to meters if needed)
-            mesh = normalize_mesh_units(mesh, target_unit='meters')
+            if file_ext in ['dwg', 'dxf']:
+                # For DWG/DXF, use ezdxf to extract 3D faces
+                if ezdxf is None:
+                    QMessageBox.critical(
+                        self,
+                        "Missing Library",
+                        "The 'ezdxf' library is required for DWG/DXF files.\n\n"
+                        "Please install it with:\npip install ezdxf\n\n"
+                        "Then restart the application."
+                    )
+                    return
 
+                try:
+                    mesh = self._load_dwg_as_mesh(path)
+                except Exception as dwg_err:
+                    QMessageBox.critical(
+                        self,
+                        "DWG/DXF Import Error",
+                        f"Could not load DWG/DXF file:\n{str(dwg_err)}\n\n"
+                        f"Make sure the file contains 3D faces or 3DFACE entities.\n"
+                        f"Tip: Try exporting as OBJ from your CAD software instead."
+                    )
+                    return
 
-            # Convert UnifiedMesh to trimesh for compatibility with SurfaceSelector
-            if hasattr(mesh, 'to_trimesh'):
-                mesh = mesh.to_trimesh()
+            elif file_ext == 'skp':
+                # For SketchUp files, try trimesh with sketchup plugin
+                try:
+                    # Trimesh can load SKP files if the sketchup-api plugin is available
+                    mesh = trimesh.load(path, force='mesh')
+                except Exception as skp_err:
+                    QMessageBox.critical(
+                        self,
+                        "SketchUp Import Error",
+                        f"Could not load SketchUp file:\n{str(skp_err)}\n\n"
+                        f"SketchUp (.skp) files require additional dependencies.\n\n"
+                        f"Recommended solutions:\n"
+                        f"1. Export your SketchUp model as OBJ format (File → Export → 3D Model → OBJ)\n"
+                        f"2. Or install: pip install trimesh[easy]\n\n"
+                        f"OBJ format is recommended for best compatibility."
+                    )
+                    return
+
+            else:
+                # For OBJ and other formats, use trimesh directly
+                try:
+                    mesh = trimesh.load(path, force='mesh')
+                except Exception as obj_err:
+                    QMessageBox.critical(
+                        self,
+                        "Import Error",
+                        f"Could not load 3D model:\n{str(obj_err)}\n\n"
+                        f"Supported formats: OBJ (recommended), DXF, DWG\n"
+                        f"For SketchUp files, please export as OBJ format."
+                    )
+                    return
+
+            # Verify mesh has required data
+            if not hasattr(mesh, 'faces') or not hasattr(mesh, 'vertices'):
+                QMessageBox.critical(
+                    self,
+                    "Invalid Mesh",
+                    "The loaded model doesn't contain valid mesh data.\n\n"
+                    "Please ensure the file contains 3D geometry (faces and vertices)."
+                )
+                return
+
+            if len(mesh.faces) == 0:
+                QMessageBox.critical(
+                    self,
+                    "Empty Mesh",
+                    "The loaded model doesn't contain any faces.\n\n"
+                    "Please ensure the file contains visible 3D geometry."
+                )
+                return
 
             # Store the mesh in GL widget
             self.gl_widget.imported_mesh = mesh
-            # Initialize SurfaceSelector immediately so groups are available for pick/selection
-            try:
-                self.gl_widget.surface_selector = SurfaceSelector(mesh)
-            except Exception as e:
-                # Non-fatal: leave selector None and fallback to per-face selection
-                print(f"Warning: SurfaceSelector initialization failed: {e}")
             self.gl_widget.surface_selection_mode = False
             self.gl_widget.selected_surface = None
 
@@ -2999,49 +2786,32 @@ class MainWindow(QMainWindow):
             # Hide tiles during 3D model viewing
             self.showtiles_cb.setChecked(False)
 
-            # Update the 3D view to show the texture
+            # Update 3D view
             self.gl_widget.update()
 
-            # Inform user about precomputed surface groups (if available)
-            try:
-                if hasattr(self.gl_widget, 'surface_selector') and self.gl_widget.surface_selector is not None:
-                    group_count = self.gl_widget.surface_selector.get_group_count()
-                    face_count = len(mesh.faces)
-                    perf_mode = "Wireframe (Fast)" if face_count > 10000 else "Full Detail"
-                    perf_tip = "\n⚡ Large model detected - using optimized rendering mode." if face_count > 10000 else ""
-                    QMessageBox.information(
-                    self,
-                    "Model Loaded Successfully",
-                    f"✅ 3D model loaded successfully!\n\n"
-                    f"📁 File: {filename}\n"
-                    f"📊 Faces: {face_count:,}\n"
-                    f"📍 Vertices: {len(mesh.vertices):,}\n"
-                    f"🔗 Surface groups detected: {group_count}\n"
-                    f"🎨 Render Mode: {perf_mode}{perf_tip}\n\n"
-                    f"📷 Camera automatically positioned to frame the model.\n\n"
-                    f"Next steps:\n"
-                    f"1. Rotate/zoom to view the model (drag mouse)\n"
-                    f"2. Click 'Select Surface for Tiling'\n"
-                    f"3. Click on any surface in the 3D view (Ctrl+click for multi-select)\n"
-                    f"4. Click 'Compute and Visualize Layout' to generate tiles."
-                )
-                else:
-                    QMessageBox.information(
-                        self,
-                        "Model Loaded Successfully",
-                        f"✅ 3D model loaded successfully!\n\nFile: {filename}\nFaces: {len(mesh.faces):,}\nVertices: {len(mesh.vertices):,}\n\n"
-                        f"Surface grouping not available; selection will be per-triangle."
-                    )
-            except Exception:
-                pass
+            # Show performance mode info
+            face_count = len(mesh.faces)
+            perf_mode = "Wireframe (Fast)" if face_count > 10000 else "Full Detail"
+            perf_tip = ""
+            if face_count > 10000:
+                perf_tip = "\n⚡ Large model detected - using optimized rendering mode."
 
-        except ModelLoadError as e:
-            # Friendly error from model_loader.py with specific guidance
-            QMessageBox.critical(
+            QMessageBox.information(
                 self,
-                "Could not load 3D Model",
-                str(e)
+                "Model Loaded Successfully",
+                f"✅ 3D model loaded successfully!\n\n"
+                f"📁 File: {filename}\n"
+                f"📊 Faces: {face_count:,}\n"
+                f"📍 Vertices: {len(mesh.vertices):,}\n"
+                f"🎨 Render Mode: {perf_mode}{perf_tip}\n\n"
+                f"📷 Camera automatically positioned to frame the model.\n\n"
+                f"Next steps:\n"
+                f"1. Rotate/zoom to view the model (drag mouse)\n"
+                f"2. Click 'Select Surface for Tiling'\n"
+                f"3. Click on any surface in the 3D view\n"
+                f"4. Click 'Compute and Visualize Layout'"
             )
+
         except Exception as e:
             QMessageBox.critical(
                 self,
@@ -3050,9 +2820,7 @@ class MainWindow(QMainWindow):
                 f"Please try exporting your model as OBJ format for best compatibility."
             )
 
-    # NOTE: _load_dwg_as_mesh is now replaced by model_loader.load_dwg_model()
-    # Keeping this as reference only - not used anymore
-    def _load_dwg_as_mesh_DEPRECATED(self, path):
+    def _load_dwg_as_mesh(self, path):
         """Convert DWG/DXF 3D faces to a trimesh object with enhanced support for multiple entity types."""
         try:
             doc = ezdxf.readfile(path)
@@ -3221,130 +2989,173 @@ class MainWindow(QMainWindow):
 
         self.gl_widget.update()
 
-    def clear_surface_selection(self):
-        """Clear all selected surfaces from the 3D model."""
-        self.gl_widget.selected_surfaces.clear()
-        self.gl_widget.selected_surface = None
-        self.update_selection_info()
-        self.gl_widget.update()
-
-    def update_selection_info(self):
-        """Update the surface info label to show the count of selected surfaces."""
-        # Prefer to show number of logical surface groups selected when a selector exists
-        sel = self.gl_widget.selected_surfaces
-        if not sel:
-            self.surface_info_label.setText("No surface selected")
-            self.surface_info_label.setStyleSheet("color: gray; font-size: 9pt;")
-            return
-
-        if hasattr(self.gl_widget, 'surface_selector') and self.gl_widget.surface_selector is not None:
-            # Map selected faces -> group ids
-            gids = set()
-            for f in sel:
-                gid = self.gl_widget.surface_selector.get_group_id_for_face(f)
-                if gid is not None:
-                    gids.add(gid)
-            group_count = len(gids) if gids else len(sel)
-            if group_count == 1:
-                self.surface_info_label.setText(f"✓ 1 surface selected (red)")
-            else:
-                self.surface_info_label.setText(f"✓ {group_count} surfaces selected (red)")
-            self.surface_info_label.setStyleSheet("color: #CC3333; font-size: 9pt; font-weight: bold;")
-        else:
-            # Fallback: show number of faces selected
-            count = len(sel)
-            if count == 1:
-                self.surface_info_label.setText(f"✓ 1 surface selected (red)")
-            else:
-                self.surface_info_label.setText(f"✓ {count} surfaces selected (red)")
-            self.surface_info_label.setStyleSheet("color: #CC3333; font-size: 9pt; font-weight: bold;")
-
     def on_surface_selected(self, surface_idx):
         """Callback when a surface is selected from the 3D model.
-        Extract dimensions using SurfaceSelector and update UI controls."""
+        Extract dimensions and update UI controls."""
         if not hasattr(self.gl_widget, 'imported_mesh') or self.gl_widget.imported_mesh is None:
             return
 
         mesh = self.gl_widget.imported_mesh
+        face = mesh.faces[surface_idx]
 
-        # Use SurfaceSelector for enhanced selection
-        if self.gl_widget.surface_selector is None:
-            if MODEL_IMPORT_AVAILABLE:
-                self.gl_widget.surface_selector = SurfaceSelector(mesh)
-            else:
-                # Fallback to simple bounding box
-                face = mesh.faces[surface_idx]
-                vertices = np.array([mesh.vertices[idx] for idx in face])
-                min_coords = vertices.min(axis=0)
-                max_coords = vertices.max(axis=0)
-                dimensions = max_coords - min_coords
-                width = float(max(dimensions[0], dimensions[1]))
-                length = float(min(dimensions[0], dimensions[1]))
-                self.rw_in.setValue(width)
-                self.rl_in.setValue(length)
-                self.surface_info_label.setText(f"✓ Selected: {width:.2f}m × {length:.2f}m")
-                self.surface_info_label.setStyleSheet("color: green; font-size: 9pt;")
-                return
+        # Get vertices of the selected face
+        vertices = [mesh.vertices[idx] for idx in face]
 
-        selector = self.gl_widget.surface_selector
+        # Calculate surface dimensions using bounding box
+        vertices_array = np.array(vertices)
+        min_coords = vertices_array.min(axis=0)
+        max_coords = vertices_array.max(axis=0)
 
-        # Select the face and expand to coplanar region
-        selector.select_face(surface_idx)
-        coplanar_faces = selector.select_coplanar_region(surface_idx, angle_threshold=5.0)
-
-        # Validate the surface
-        validation = selector.validate_surface(coplanar_faces)
-
-        if not validation.is_valid:
-            QMessageBox.warning(
-                self,
-                "Surface Planarity Warning",
-                f"{validation.message}\n\n"
-                f"The surface may not be ideal for tiling.\n"
-                f"Consider selecting a flatter surface or using manual input."
-            )
-
-        # Get projected dimensions (more accurate for tilted surfaces)
-        projected_dims = selector.get_surface_bounds_projected(coplanar_faces)
-
-        if projected_dims:
-            width, length = projected_dims
-        else:
-            # Fallback to simple bounding box
-            face = mesh.faces[surface_idx]
-            vertices = np.array([mesh.vertices[idx] for idx in face])
-            min_coords = vertices.min(axis=0)
-            max_coords = vertices.max(axis=0)
-            dimensions = max_coords - min_coords
-            width = float(max(dimensions[0], dimensions[1]))
-            length = float(min(dimensions[0], dimensions[1]))
+        # Calculate dimensions (width and length)
+        dimensions = max_coords - min_coords
+        width = max(dimensions[0], dimensions[1])
+        length = min(dimensions[0], dimensions[1])
 
         # Update room dimensions in UI
         self.rw_in.setValue(float(width))
         self.rl_in.setValue(float(length))
 
-        # Update UI labels with coplanar face count
-        face_info = f"{len(coplanar_faces)} faces" if len(coplanar_faces) > 1 else "1 face"
-        self.surface_info_label.setText(f"✓ Selected: {width:.2f}m × {length:.2f}m ({face_info})")
-        self.surface_info_label.setStyleSheet("color: green; font-size: 9pt; font-weight: bold;")
+        # Update UI labels
+        self.surface_info_label.setText(f"✓ Surface selected: {width:.2f}m × {length:.2f}m")
+        self.surface_info_label.setStyleSheet("color: green; font-size: 9pt;")
 
         self.select_surface_btn.setText("Select Surface for Tiling")
         self.select_surface_btn.setStyleSheet("")
-
-        # Store surface info for layout generation
-        self._selected_surface_info = selector.get_surface_info(coplanar_faces)
 
         QMessageBox.information(
             self,
             "Surface Selected",
             f"Surface dimensions extracted:\n\n"
             f"Width: {width:.2f} meters\n"
-            f"Length: {length:.2f} meters\n"
-            f"Faces: {len(coplanar_faces)}\n"
-            f"Planar: {'Yes ✓' if validation.is_planar else 'No ⚠'}\n\n"
+            f"Length: {length:.2f} meters\n\n"
             f"The room dimensions have been updated.\n"
-            f"Click 'Compute and Visualize Layout' to generate tiles."
+            f"Click 'Compute and Visualize Layout' to generate tiles on this surface."
         )
+
+
+        # Track which fields have been manually edited (to avoid overwriting user changes)
+        self.density_edited = False
+        self.weight_edited = False
+        self.thermal_r_edited = False
+
+        # Connect to valueChanged signals to track manual edits
+        self.density_in.valueChanged.connect(lambda: setattr(self, 'density_edited', True))
+        self.weight_in.valueChanged.connect(lambda: setattr(self, 'weight_edited', True))
+        self.thermal_r_in.valueChanged.connect(lambda: setattr(self, 'thermal_r_edited', True))
+
+        material_g.setLayout(material_f)
+        self.control_layout.addWidget(material_g)
+
+        slope_g = QGroupBox("Original Subfloor Slope / Elevation")
+        slope_f = QFormLayout()
+        self.sbz_in=QDoubleSpinBox(minimum=-10,maximum=10,value=-0.05,decimals=3,singleStep=0.01)
+        self.sx_in=QDoubleSpinBox(minimum=-0.5,maximum=0.5,value=0.02,decimals=3,singleStep=0.001)
+        self.sy_in=QDoubleSpinBox(minimum=-0.5,maximum=0.5,value=0.01,decimals=3,singleStep=0.001)
+        slope_f.addRow("Base Z (at origin):",self.sbz_in)
+        slope_f.addRow("Slope X (Z-change/m):",self.sx_in); slope_f.addRow("Slope Y (Z-change/m):",self.sy_in)
+        # Elevation mode and import
+        self.elev_mode_cb = QtWidgets.QComboBox(); self.elev_mode_cb.addItems(["Flat", "Planar", "Irregular Map"])
+        self.import_elev_btn = QPushButton("Import Elevation Map")
+        self.import_elev_btn.clicked.connect(self.import_elevation_file)
+        slope_f.addRow("Elevation Mode:", self.elev_mode_cb)
+        slope_f.addRow(self.import_elev_btn)
+        slope_g.setLayout(slope_f); self.control_layout.addWidget(slope_g)
+
+
+        # QR Code Size Slider
+        qrsize_g = QGroupBox("QR Code Size")
+        qrsize_f = QFormLayout()
+        self.qrsize_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.qrsize_slider.setMinimum(0)
+        self.qrsize_slider.setMaximum(50)
+        self.qrsize_slider.setValue(10)
+        self.qrsize_slider.setTickInterval(1)
+        self.qrsize_slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
+        self.qrsize_label = QLabel("QR Size: 10% of tile")
+        self.qrsize_slider.valueChanged.connect(lambda v: self.qrsize_label.setText(f"QR Size: {v}% of tile"))
+        # Update visualization when slider changes
+        self.qrsize_slider.valueChanged.connect(self.on_qrsize_changed)
+        qrsize_f.addRow(self.qrsize_label, self.qrsize_slider)
+        qrsize_g.setLayout(qrsize_f)
+        self.control_layout.addWidget(qrsize_g)
+
+        # Visualization toggles
+        vis_g = QGroupBox("Visualization")
+        vis_f = QFormLayout()
+        self.wireframe_cb = QtWidgets.QCheckBox("Wireframe Tiles")
+        self.elevmap_cb = QtWidgets.QCheckBox("Show Elevation Map")
+        self.showtiles_cb = QtWidgets.QCheckBox("Show Tiles")
+        self.showtiles_cb.setChecked(True)
+        self.showqr_cb = QtWidgets.QCheckBox("Show QR Codes")
+        self.showqr_cb.setChecked(True)
+        # Connect visualization checkboxes to instant update (no recompute needed)
+        self.wireframe_cb.stateChanged.connect(self.on_visualization_toggle)
+        self.elevmap_cb.stateChanged.connect(self.on_visualization_toggle)
+        self.showtiles_cb.stateChanged.connect(self.on_visualization_toggle)
+        self.showqr_cb.stateChanged.connect(self.toggle_qr_visibility)
+        vis_f.addRow(self.wireframe_cb)
+        vis_f.addRow(self.elevmap_cb)
+        vis_f.addRow(self.showtiles_cb)
+        vis_f.addRow(self.showqr_cb)
+        vis_g.setLayout(vis_f); self.control_layout.addWidget(vis_g)
+
+        self.comp_btn = QPushButton("Compute and Visualize Layout"); self.comp_btn.clicked.connect(self.update_visualization)
+        self.control_layout.addWidget(self.comp_btn)
+
+        # --- START: New UI elements for Exporting ---
+        self.export_obj_btn = QPushButton("Export Scene to .OBJ File")
+        self.export_obj_btn.clicked.connect(self.export_scene_to_obj)
+        self.control_layout.addWidget(self.export_obj_btn)
+
+        self.export_report_btn = QPushButton("Export Layout Report (.txt)")
+        self.export_report_btn.clicked.connect(self.export_layout_report)
+        self.control_layout.addWidget(self.export_report_btn)
+
+        self.export_dxf_btn = QPushButton("Export to AutoCAD (.DXF)")
+        self.export_dxf_btn.clicked.connect(self.export_scene_to_dxf)
+        self.control_layout.addWidget(self.export_dxf_btn)
+        # --- END: New UI elements for Exporting ---
+
+        self.control_layout.addStretch()
+        self.scroll_area.setWidget(self.control_panel_widget)
+
+        self.splitter.addWidget(self.scroll_area)
+        self.gl_widget = GLWidget(self)
+        self.gl_widget.tileClicked.connect(self.show_tile_info_dialog)
+        self.gl_widget.pedestalClicked.connect(self.show_pedestal_height)
+
+        # Create a container for GL widget with overlay for pedestal height display
+        gl_container = QWidget()
+        gl_container_layout = QVBoxLayout(gl_container)
+        gl_container_layout.setContentsMargins(0, 0, 0, 0)
+        gl_container_layout.addWidget(self.gl_widget)
+
+        # Pedestal height display panel (floating overlay)
+        self.pedestal_height_panel = QLabel()
+        self.pedestal_height_panel.setStyleSheet("""
+            QLabel {
+                background-color: rgba(50, 50, 50, 220);
+                color: white;
+                padding: 12px 16px;
+                border-radius: 8px;
+                font-size: 14pt;
+                font-weight: bold;
+                border: 2px solid #FFA500;
+            }
+        """)
+        self.pedestal_height_panel.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.pedestal_height_panel.hide()
+        self.pedestal_height_panel.setParent(self.gl_widget)
+
+        self.splitter.addWidget(gl_container)
+        self.splitter.setSizes([380, self.width() - 380])
+        self.splitter.setStretchFactor(1, 1)
+
+        main_hbox = QHBoxLayout(self.central_widget)
+        main_hbox.addWidget(self.splitter)
+
+        # Defer first visualization until after the window is shown to ensure a GL context
+        QtCore.QTimer.singleShot(0, self.update_visualization)
 
     def on_material_changed(self, material_name):
         """Update material properties when material is selected from dropdown.
@@ -3395,11 +3206,434 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.information(self, "Import Successful", f"Loaded polygon with {len(self.gl_widget.room_input.polygon)} points")
 
-    def import_elevation_file(self):
-        """Import elevation map from a text file with x,y,z coordinates."""
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import Elevation Map (x,y,z per line)", "", "Text/CSV Files (*.txt *.csv);;All Files (*)")
+    def edit_polygon_points(self):
+        # small dialog to paste points (x y per line)
+        d = QDialog(self)
+        d.setWindowTitle("Edit Polygon Points (x y per line)")
+        v = QVBoxLayout(d)
+        te = QtWidgets.QPlainTextEdit()
+        # populate existing
+        if self.gl_widget.room_input.polygon:
+            txt = "\n".join(f"{x} {y}" for x,y in self.gl_widget.room_input.polygon)
+            te.setPlainText(txt)
+        v.addWidget(te)
+        hb = QHBoxLayout(); okb = QPushButton("OK"); cb = QPushButton("Cancel")
+        hb.addWidget(okb); hb.addWidget(cb)
+        v.addLayout(hb)
+        def do_ok():
+            txt = te.toPlainText().strip()
+            pts = []
+            for ln in txt.splitlines():
+                ln = ln.strip()
+                if not ln: continue
+                parts = [p for p in ln.replace(',', ' ').split() if p]
+                if len(parts) < 2: continue
+                try:
+                    pts.append((float(parts[0]), float(parts[1])))
+                except Exception:
+                    continue
+            if len(pts) < 3:
+                QMessageBox.critical(self, "Invalid Polygon", "Please enter at least 3 points.")
+                return
+            self.gl_widget.room_input.set_polygon(pts)
+            d.accept()
+        okb.clicked.connect(do_ok); cb.clicked.connect(d.reject)
+        d.exec()
+
+    def on_room_mode_changed(self, mode_text):
+        """Show/hide controls based on selected room input mode."""
+        # Hide all mode-specific controls first
+        self.import_room_btn.hide()
+        self.edit_polygon_btn.hide()
+        self.import_3d_model_btn.hide()
+        self.model_status_label.hide()
+        self.select_surface_btn.hide()
+        self.surface_info_label.hide()
+
+        # Show relevant controls based on mode
+        if "Manual" in mode_text:
+            pass  # Manual mode uses default W×L inputs (always visible)
+        elif "Polygon" in mode_text:
+            self.edit_polygon_btn.show()
+        elif "Import from File" in mode_text:
+            self.import_room_btn.show()
+        elif "Import 3D Model" in mode_text:
+            self.import_3d_model_btn.show()
+            self.model_status_label.show()
+            self.select_surface_btn.show()
+            self.surface_info_label.show()
+
+    def import_3d_model(self):
+        """Import a 3D model file (.obj, .dwg, .dxf, .skp) for surface selection."""
+        if trimesh is None:
+            QMessageBox.critical(
+                self,
+                "Missing Library",
+                "The 'trimesh' library is required for 3D model import.\n\n"
+                "Please install it with:\npip install trimesh"
+            )
+            return
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Import 3D Model",
+            "",
+            "3D Model Files (*.obj *.dwg *.dxf *.skp);;OBJ Files (*.obj);;DWG/DXF Files (*.dwg *.dxf);;SketchUp Files (*.skp);;All Files (*)"
+        )
         if not path:
             return
+
+        try:
+            # Load the mesh using trimesh with format-specific handling
+            file_ext = path.lower().split('.')[-1]
+
+            if file_ext in ['dwg', 'dxf']:
+                # For DWG/DXF, use ezdxf to extract 3D faces
+                if ezdxf is None:
+                    QMessageBox.critical(
+                        self,
+                        "Missing Library",
+                        "The 'ezdxf' library is required for DWG/DXF files.\n\n"
+                        "Please install it with:\npip install ezdxf\n\n"
+                        "Then restart the application."
+                    )
+                    return
+
+                try:
+                    mesh = self._load_dwg_as_mesh(path)
+                except Exception as dwg_err:
+                    QMessageBox.critical(
+                        self,
+                        "DWG/DXF Import Error",
+                        f"Could not load DWG/DXF file:\n{str(dwg_err)}\n\n"
+                        f"Make sure the file contains 3D faces or 3DFACE entities.\n"
+                        f"Tip: Try exporting as OBJ from your CAD software instead."
+                    )
+                    return
+
+            elif file_ext == 'skp':
+                # For SketchUp files, try trimesh with sketchup plugin
+                try:
+                    # Trimesh can load SKP files if the sketchup-api plugin is available
+                    mesh = trimesh.load(path, force='mesh')
+                except Exception as skp_err:
+                    QMessageBox.critical(
+                        self,
+                        "SketchUp Import Error",
+                        f"Could not load SketchUp file:\n{str(skp_err)}\n\n"
+                        f"SketchUp (.skp) files require additional dependencies.\n\n"
+                        f"Recommended solutions:\n"
+                        f"1. Export your SketchUp model as OBJ format (File → Export → 3D Model → OBJ)\n"
+                        f"2. Or install: pip install trimesh[easy]\n\n"
+                        f"OBJ format is recommended for best compatibility."
+                    )
+                    return
+
+            else:
+                # For OBJ and other formats, use trimesh directly
+                try:
+                    mesh = trimesh.load(path, force='mesh')
+                except Exception as obj_err:
+                    QMessageBox.critical(
+                        self,
+                        "Import Error",
+                        f"Could not load 3D model:\n{str(obj_err)}\n\n"
+                        f"Supported formats: OBJ (recommended), DXF, DWG\n"
+                        f"For SketchUp files, please export as OBJ format."
+                    )
+                    return
+
+            # Verify mesh has required data
+            if not hasattr(mesh, 'faces') or not hasattr(mesh, 'vertices'):
+                QMessageBox.critical(
+                    self,
+                    "Invalid Mesh",
+                    "The loaded model doesn't contain valid mesh data.\n\n"
+                    "Please ensure the file contains 3D geometry (faces and vertices)."
+                )
+                return
+
+            if len(mesh.faces) == 0:
+                QMessageBox.critical(
+                    self,
+                    "Empty Mesh",
+                    "The loaded model doesn't contain any faces.\n\n"
+                    "Please ensure the file contains visible 3D geometry."
+                )
+                return
+
+            # Store the mesh in GL widget
+            self.gl_widget.imported_mesh = mesh
+            self.gl_widget.surface_selection_mode = False
+            self.gl_widget.selected_surface = None
+
+            # Clear existing tiles so imported model is visible
+            self.gl_widget.tiles.clear()
+            self.gl_widget.pedestals.clear()
+
+            # Auto-position camera to frame the imported model
+            self._frame_imported_mesh(mesh)
+
+            # Update UI
+            import os
+            filename = os.path.basename(path)
+            self.model_status_label.setText(f"✓ {filename}")
+            self.model_status_label.setStyleSheet("color: green; font-size: 9pt;")
+            self.surface_info_label.setText("No surface selected")
+            self.surface_info_label.setStyleSheet("color: gray; font-size: 9pt;")
+
+            # Hide tiles during 3D model viewing
+            self.showtiles_cb.setChecked(False)
+
+            # Update 3D view
+            self.gl_widget.update()
+
+            # Show performance mode info
+            face_count = len(mesh.faces)
+            perf_mode = "Wireframe (Fast)" if face_count > 10000 else "Full Detail"
+            perf_tip = ""
+            if face_count > 10000:
+                perf_tip = "\n⚡ Large model detected - using optimized rendering mode."
+
+            QMessageBox.information(
+                self,
+                "Model Loaded Successfully",
+                f"✅ 3D model loaded successfully!\n\n"
+                f"📁 File: {filename}\n"
+                f"📊 Faces: {face_count:,}\n"
+                f"📍 Vertices: {len(mesh.vertices):,}\n"
+                f"🎨 Render Mode: {perf_mode}{perf_tip}\n\n"
+                f"📷 Camera automatically positioned to frame the model.\n\n"
+                f"Next steps:\n"
+                f"1. Rotate/zoom to view the model (drag mouse)\n"
+                f"2. Click 'Select Surface for Tiling'\n"
+                f"3. Click on any surface in the 3D view\n"
+                f"4. Click 'Compute and Visualize Layout'"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Unexpected Error",
+                f"An unexpected error occurred:\n{str(e)}\n\n"
+                f"Please try exporting your model as OBJ format for best compatibility."
+            )
+
+    def _load_dwg_as_mesh(self, path):
+        """Convert DWG/DXF 3D faces to a trimesh object with enhanced support for multiple entity types."""
+        try:
+            doc = ezdxf.readfile(path)
+        except Exception as e:
+            raise ValueError(f"Cannot read DWG/DXF file: {str(e)}")
+
+        msp = doc.modelspace()
+
+        vertices = []
+        faces = []
+        vertex_map = {}
+
+        def get_vertex_index(v):
+            """Add vertex to list if not exists, return index."""
+            key = (round(v[0], 6), round(v[1], 6), round(v[2], 6))
+            if key not in vertex_map:
+                vertex_map[key] = len(vertices)
+                vertices.append([v[0], v[1], v[2]])
+            return vertex_map[key]
+
+        entity_count = {'3DFACE': 0, 'POLYLINE': 0, 'MESH': 0, 'POLYFACE': 0, 'OTHER': 0}
+
+        # Extract 3DFACE entities (most common in CAD exports)
+        for entity in msp.query('3DFACE'):
+            entity_count['3DFACE'] += 1
+            try:
+                pts = [entity.dxf.vtx0, entity.dxf.vtx1, entity.dxf.vtx2]
+                # Check if it's a quad (4th vertex different from 3rd)
+                if hasattr(entity.dxf, 'vtx3'):
+                    vtx3 = entity.dxf.vtx3
+                    # If quad, split into two triangles
+                    if vtx3 != entity.dxf.vtx2:
+                        # Triangle 1: v0, v1, v2
+                        indices = [get_vertex_index((p[0], p[1], p[2])) for p in pts]
+                        faces.append(indices)
+                        # Triangle 2: v0, v2, v3
+                        indices2 = [get_vertex_index((pts[0][0], pts[0][1], pts[0][2])),
+                                   get_vertex_index((pts[2][0], pts[2][1], pts[2][2])),
+                                   get_vertex_index((vtx3[0], vtx3[1], vtx3[2]))]
+                        faces.append(indices2)
+                    else:
+                        # Just a triangle
+                        indices = [get_vertex_index((p[0], p[1], p[2])) for p in pts]
+                        faces.append(indices)
+                else:
+                    # Triangle only
+                    indices = [get_vertex_index((p[0], p[1], p[2])) for p in pts]
+                    faces.append(indices)
+            except Exception:
+                continue
+
+        # Extract MESH entities (AutoCAD mesh objects)
+        for entity in msp.query('MESH'):
+            entity_count['MESH'] += 1
+            try:
+                if hasattr(entity, 'vertices') and hasattr(entity, 'faces'):
+                    vert_start_idx = len(vertices)
+                    for v in entity.vertices:
+                        vertices.append([v[0], v[1], v[2]])
+                    for face in entity.faces:
+                        if len(face) >= 3:
+                            indices = [vert_start_idx + face[i] for i in range(3)]
+                            faces.append(indices)
+            except Exception:
+                continue
+
+        # Extract POLYFACE entities
+        for entity in msp.query('POLYLINE'):
+            if entity.is_poly_face_mesh:
+                entity_count['POLYFACE'] += 1
+                try:
+                    mesh_vertices = list(entity.points())
+                    vert_start_idx = len(vertices)
+                    for v in mesh_vertices:
+                        vertices.append([v[0], v[1], v[2]])
+                    # Extract faces from polyface
+                    if hasattr(entity, 'faces'):
+                        for face in entity.faces():
+                            face_indices = [i for i in face if i > 0]
+                            if len(face_indices) >= 3:
+                                indices = [vert_start_idx + face_indices[i] - 1 for i in range(3)]
+                                faces.append(indices)
+                except Exception:
+                    continue
+            else:
+                entity_count['POLYLINE'] += 1
+
+        # Build error message if no faces found
+        if not faces:
+            error_msg = "No 3D faces found in DWG/DXF file.\n\n"
+            error_msg += "Entities found:\n"
+            for entity_type, count in entity_count.items():
+                if count > 0:
+                    error_msg += f"  - {entity_type}: {count}\n"
+
+            error_msg += "\n💡 Tips:\n"
+            error_msg += "• Make sure the file contains 3D geometry (not just 2D drawings)\n"
+            error_msg += "• In AutoCAD, use '3DFACE' or 'MESH' objects\n"
+            error_msg += "• Try exporting as OBJ format for better compatibility\n"
+            error_msg += "• In AutoCAD: File → Export → Select 'OBJ (*.obj)'"
+
+            raise ValueError(error_msg)
+
+        print(f"Loaded DWG/DXF: {len(vertices)} vertices, {len(faces)} faces")
+        return trimesh.Trimesh(vertices=np.array(vertices), faces=np.array(faces))
+
+    def _frame_imported_mesh(self, mesh):
+        """Automatically position the camera to frame the imported 3D model."""
+        # Calculate bounding box of the mesh
+        vertices = np.array(mesh.vertices)
+        min_coords = vertices.min(axis=0)
+        max_coords = vertices.max(axis=0)
+        center = (min_coords + max_coords) / 2.0
+
+        # Calculate the size of the bounding box
+        size = max_coords - min_coords
+        max_dimension = max(size)
+
+        # Set camera to look at the center of the model
+        self.gl_widget.room_center_for_rotation = QVector3D(
+            float(center[0]),
+            float(center[1]),
+            float(center[2])
+        )
+
+        # Set camera distance based on model size (add some margin)
+        self.gl_widget.camera_distance = max_dimension * 2.0
+
+        # Reset camera angles to get a good initial view
+        self.gl_widget.camera_azimuth = 45.0
+        self.gl_widget.camera_elevation = 30.0
+
+        # Update the GL widget
+        self.gl_widget.makeCurrent()
+        self.gl_widget.resizeGL(self.gl_widget.width(), self.gl_widget.height())
+        self.gl_widget.doneCurrent()
+
+        print(f"Camera positioned: center={center}, distance={self.gl_widget.camera_distance:.2f}")
+
+    def activate_surface_selection(self):
+        """Activate surface selection mode in the 3D viewer."""
+        if not hasattr(self.gl_widget, 'imported_mesh') or self.gl_widget.imported_mesh is None:
+            QMessageBox.warning(
+                self,
+                "No Model Loaded",
+                "Please import a 3D model first before selecting a surface."
+            )
+            return
+
+        # Toggle selection mode
+        self.gl_widget.surface_selection_mode = not self.gl_widget.surface_selection_mode
+
+        if self.gl_widget.surface_selection_mode:
+            self.select_surface_btn.setText("Cancel Surface Selection")
+            self.select_surface_btn.setStyleSheet("background-color: #FFA500; font-weight: bold;")
+            QMessageBox.information(
+                self,
+                "Surface Selection Active",
+                "Click on any surface in the 3D view to select it for tiling.\n\n"
+                "The selected surface will turn green.\n"
+                "Click 'Cancel Surface Selection' to exit this mode."
+            )
+        else:
+            self.select_surface_btn.setText("Select Surface for Tiling")
+            self.select_surface_btn.setStyleSheet("")
+
+        self.gl_widget.update()
+
+    def on_surface_selected(self, surface_idx):
+        """Callback when a surface is selected from the 3D model.
+        Extract dimensions and update UI controls."""
+        if not hasattr(self.gl_widget, 'imported_mesh') or self.gl_widget.imported_mesh is None:
+            return
+
+        mesh = self.gl_widget.imported_mesh
+        face = mesh.faces[surface_idx]
+
+        # Get vertices of the selected face
+        vertices = [mesh.vertices[idx] for idx in face]
+
+        # Calculate surface dimensions using bounding box
+        vertices_array = np.array(vertices)
+        min_coords = vertices_array.min(axis=0)
+        max_coords = vertices_array.max(axis=0)
+
+        # Calculate dimensions (width and length)
+        dimensions = max_coords - min_coords
+        width = max(dimensions[0], dimensions[1])
+        length = min(dimensions[0], dimensions[1])
+
+        # Update room dimensions in UI
+        self.rw_in.setValue(float(width))
+        self.rl_in.setValue(float(length))
+
+        # Update UI labels
+        self.surface_info_label.setText(f"✓ Surface selected: {width:.2f}m × {length:.2f}m")
+        self.surface_info_label.setStyleSheet("color: green; font-size: 9pt;")
+
+        self.select_surface_btn.setText("Select Surface for Tiling")
+        self.select_surface_btn.setStyleSheet("")
+
+        QMessageBox.information(
+            self,
+            "Surface Selected",
+            f"Surface dimensions extracted:\n\n"
+            f"Width: {width:.2f} meters\n"
+            f"Length: {length:.2f} meters\n\n"
+            f"The room dimensions have been updated.\n"
+            f"Click 'Compute and Visualize Layout' to generate tiles on this surface."
+        )
+
+    def import_elevation_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import Elevation Map (x,y,z per line)", "", "Text/CSV Files (*.txt *.csv);;All Files (*)")
+        if not path: return
         ok, err = self.gl_widget.elevation_model.load_points_from_file(path)
         if not ok:
             QMessageBox.critical(self, "Import Error", f"Could not parse elevation file:\n{err}")
@@ -3441,41 +3675,6 @@ class MainWindow(QMainWindow):
             f"Click 'Compute and Visualize Layout' to see the textured tiles."
         )
 
-    def edit_polygon_points(self):
-        # small dialog to paste points (x y per line)
-        d = QDialog(self)
-        d.setWindowTitle("Edit Polygon Points (x y per line)")
-        v = QVBoxLayout(d)
-        te = QtWidgets.QPlainTextEdit()
-        # populate existing
-        if self.gl_widget.room_input.polygon:
-            txt = "\n".join(f"{x} {y}" for x,y in self.gl_widget.room_input.polygon)
-            te.setPlainText(txt)
-        v.addWidget(te)
-        hb = QHBoxLayout(); okb = QPushButton("OK"); cb = QPushButton("Cancel")
-        hb.addWidget(okb); hb.addWidget(cb)
-        v.addLayout(hb)
-        def do_ok():
-            txt = te.toPlainText().strip()
-            pts = []
-            for ln in txt.splitlines():
-                ln = ln.strip()
-                if not ln: continue
-                parts = [p for p in ln.replace(',', ' ').split() if p]
-                if len(parts) < 2: continue
-                try:
-                    pts.append((float(parts[0]), float(parts[1])))
-                except Exception:
-                    continue
-            if len(pts) < 3:
-                QMessageBox.critical(self, "Invalid Polygon", "Please enter at least 3 points.")
-                return
-            self.gl_widget.room_input.set_polygon(pts)
-            d.accept()
-        okb.clicked.connect(do_ok); cb.clicked.connect(d.reject)
-        d.exec()
-
-
     def get_parameters(self):
         # derive room mode
         rm_text = self.room_mode_cb.currentText()
@@ -3515,76 +3714,8 @@ class MainWindow(QMainWindow):
         return params
 
     def update_visualization(self):
-        """
-        Main callback for 'Compute and Visualize Layout' button.
-        If surfaces are selected from a 3D model, generates tiles/pedestals
-        ONLY on those surfaces. Otherwise uses standard room-based layout.
-        """
         params = self.get_parameters()
-
-        # Check if we have selected surfaces from a 3D model
-        if (self.gl_widget.selected_surfaces and
-            self.gl_widget.imported_mesh is not None):
-
-            # Validate selection
-            valid_surfaces = [idx for idx in self.gl_widget.selected_surfaces
-                            if idx < len(self.gl_widget.imported_mesh.faces)]
-
-            if not valid_surfaces:
-                QMessageBox.warning(
-                    self,
-                    "Invalid Selection",
-                    "No valid surfaces selected.\n\n"
-                    "Please select surfaces from the 3D model first:\n"
-                    "1. Click 'Select Surface for Tiling'\n"
-                    "2. Click on surfaces (Ctrl+click for multi-select)\n"
-                    "3. Click 'Compute and Visualize Layout' to generate tiles."
-                )
-                return
-
-            # Generate tiles on selected surfaces only
-            tile_params = params['tile']
-            pedestal_height = 0.1016  # Default 4 inches
-
-            success = self.gl_widget.compute_layout_on_selected_surfaces(
-                tile_params,
-                pedestal_height=pedestal_height
-            )
-
-            if success:
-                tile_count = len(self.gl_widget.tiles)
-                ped_count = len(self.gl_widget.pedestals)
-                surface_count = len(valid_surfaces)
-
-                # Update status
-                self.surface_info_label.setText(
-                    f"✓ Layout: {tile_count} tiles, {ped_count} pedestals on {surface_count} surface(s)"
-                )
-                self.surface_info_label.setStyleSheet("color: green; font-size: 9pt; font-weight: bold;")
-
-                QMessageBox.information(
-                    self,
-                    "Layout Generated",
-                    f"Successfully generated tile layout:\n\n"
-                    f"• {tile_count} tiles\n"
-                    f"• {ped_count} pedestals\n"
-                    f"• {surface_count} surface(s)\n\n"
-                    f"Tiles and pedestals have been placed on the selected surfaces."
-                )
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Layout Generation Failed",
-                    "Could not generate tile layout on selected surfaces.\n\n"
-                    "Please ensure valid surfaces are selected."
-                )
-                return
-        else:
-            # Standard room-based layout (no surfaces selected)
-            self.gl_widget.compute_and_build_layout(params, params['tile'], params['slope'])
-
-        # Refresh the 3D view
-        self.gl_widget.update()
+        self.gl_widget.compute_and_build_layout(params, params['tile'], params['slope'])
 
     def show_tile_info_dialog(self, tile: Tile3D):
         InfoDialog(tile, self).exec()
@@ -3629,18 +3760,82 @@ class MainWindow(QMainWindow):
         self.pedestal_height_panel.show()
         self.pedestal_height_panel.raise_()  # Bring to front
 
+    # --- START: New methods for Exporting ---
+    def export_scene_to_obj(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Scene to OBJ", "3d_tile_layout.obj", "Wavefront OBJ (*.obj)")
+        if path:
+            self.gl_widget.export_scene_to_obj_file(path)
+            QMessageBox.information(self, "Export Successful", f"Scene successfully exported to:\n{path}")
 
-def _run_app():
-    app = QtWidgets.QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    try:
-        sys.exit(app.exec())
-    except SystemExit:
-        pass
+    def export_scene_to_dxf(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export to AutoCAD DXF",
+            "tile_layout.dxf",
+            "AutoCAD DXF (*.dxf)"
+        )
+        if not path:
+            return
+        # Get QR code size percent from slider
+        qr_pct = self.qrsize_slider.value() / 100.0
+        self.gl_widget.export_scene_to_dxf_file(path, qr_pct=qr_pct)
+        QMessageBox.information(self, "Export Successful",
+                                f"DXF exported to:\n{path}")
 
+    def export_layout_report(self):  
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Layout Report",
+            "layout_report.txt",
+            "Text Files (*.txt)"
+        )
 
-if __name__ == '__main__':
-    # When launched directly, start the GUI so compute_and_build_layout runs once and
-    # we can observe the debug output confirming no default floor square is created.
-    _run_app()
+        if not path:
+            return
+
+        resolved_path = Path(path)
+
+        if resolved_path.suffix.lower() != ".txt":
+            if resolved_path.is_dir():
+                resolved_path = resolved_path / "layout_report.txt"
+            else:
+                resolved_path = resolved_path.with_suffix(".txt")
+
+        path = str(resolved_path)
+
+        try:
+            report_string = self.gl_widget.generate_layout_report_string()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(report_string)
+
+            # SAFE: no QMessageBox here (avoids GL crash)
+            print(f"[OK] Layout report saved to: {path}")
+
+        except Exception as e:
+            print("[ERROR - Could not write layout report]", e)
+            # Error box is safe
+            QMessageBox.critical(self, "Export Error", str(e))
+            
+        
+if __name__ == "__main__":
+    import sys
+    from PyQt6.QtWidgets import QApplication
+
+    # Set the desired OpenGL format BEFORE creating the application
+    fmt = QSurfaceFormat()
+    fmt.setRenderableType(QSurfaceFormat.RenderableType.OpenGL)
+    # Request legacy, fixed-function compatible context (OpenGL 2.1, NoProfile)
+    fmt.setVersion(2, 1)
+    fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.NoProfile)
+    fmt.setDepthBufferSize(24)
+    fmt.setStencilBufferSize(8)
+    fmt.setSamples(0)
+    fmt.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
+    QSurfaceFormat.setDefaultFormat(fmt)
+
+    # Ensure Qt uses desktop OpenGL before creating the application
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_UseDesktopOpenGL)
+    app = QApplication(sys.argv)
+    mw = MainWindow()
+    mw.show()
+    sys.exit(app.exec())
