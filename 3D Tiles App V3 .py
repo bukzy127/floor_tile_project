@@ -516,6 +516,7 @@ class GLWidget(QOpenGLWidget):
         self.floor_triangles = []
         self._floor_vertices_flat = []
         self.ceiling_z = None  # Detected ceiling height from imported model
+        self.has_imported_model = False  # Flag to prevent default floor rendering in import mode
 
         # Visualization toggles
         self.show_wireframe = False
@@ -1330,10 +1331,10 @@ class GLWidget(QOpenGLWidget):
             print(f"[DEBUG] Available pedestal corners: {list(supported_corners_keys)[:10]}...")
 
         # Generate floor mesh for drawing (same as before but use elevation model z)
-        # Only generate a floor mesh if the room has non-zero dimensions.
+        # Only generate a floor mesh if the room has non-zero dimensions AND not in import mode.
         floor_segments = 40
         self.original_floor_mesh = []
-        if rw_param > EPSILON and rl_param > EPSILON and floor_segments > 0:
+        if not self.has_imported_model and rw_param > EPSILON and rl_param > EPSILON and floor_segments > 0:
             w_step = rw_param / floor_segments
             l_step = rl_param / floor_segments
             for i in range(floor_segments):
@@ -1705,6 +1706,9 @@ class GLWidget(QOpenGLWidget):
         glPopMatrix()
 
     def draw_original_floor(self):
+        # Don't draw default floor when in import mode
+        if self.has_imported_model:
+            return
         glColor3f(0.6, 0.6, 0.55)
         for quad in self.original_floor_mesh:
             glBegin(GL_QUADS)
@@ -1716,6 +1720,9 @@ class GLWidget(QOpenGLWidget):
 
     def draw_elevation_heatmap(self):
         # draw colored quads based on elevation
+        # Don't draw default floor when in import mode
+        if self.has_imported_model:
+            return
         if not self.original_floor_mesh:
             self.draw_original_floor(); return
         # compute min/max z
@@ -2861,10 +2868,16 @@ class MainWindow(QMainWindow):
         # Show relevant controls based on mode
         if "Manual" in mode_text:
             pass  # Manual mode uses default W×L inputs (always visible)
+            # Reset import mode flag when switching to manual
+            self.gl_widget.has_imported_model = False
         elif "Polygon" in mode_text:
             self.edit_polygon_btn.show()
+            # Reset import mode flag when switching to polygon mode
+            self.gl_widget.has_imported_model = False
         elif "Import from File" in mode_text:
             self.import_room_btn.show()
+            # Reset import mode flag when switching to file import mode
+            self.gl_widget.has_imported_model = False
         elif "Import 3D Model" in mode_text:
             self.import_3d_model_btn.show()
             self.model_status_label.show()
@@ -2967,9 +2980,13 @@ class MainWindow(QMainWindow):
             self.gl_widget.surface_selection_mode = False
             self.gl_widget.selected_surface = None
 
-            # Clear existing tiles so imported model is visible
+            # Set import mode flag to prevent default floor rendering
+            self.gl_widget.has_imported_model = True
+            
+            # Clear existing tiles, pedestals, and default floor mesh so only imported model is visible
             self.gl_widget.tiles.clear()
             self.gl_widget.pedestals.clear()
+            self.gl_widget.original_floor_mesh.clear()
 
             # Auto-position camera to frame the imported model
             self._frame_imported_mesh(mesh)
