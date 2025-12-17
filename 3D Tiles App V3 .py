@@ -517,7 +517,8 @@ class GLWidget(QOpenGLWidget):
         self._floor_vertices_flat = []
         self.ceiling_z = None  # Detected ceiling height from imported model
         self.has_imported_model = False  # Flag to prevent default floor rendering in import mode
-        self.import_room_boundary_poly = []  # Boundary polygon from selected surface in import mode
+        self.import_room_boundary_poly = []  # Boundary polygon from selected surface in import mode (2D XY)
+        self.selected_floor_boundary_3d = []  # IMPORT MODE ONLY: True 3D boundary points from mesh edge
 
         # Visualization toggles
         self.show_wireframe = False
@@ -738,6 +739,92 @@ class GLWidget(QOpenGLWidget):
         self._floor_vertices_flat = [np.array(v) for v in unique_verts]
         
         print(f"[Floor Detection] Extracted {len(self.floor_triangles)} floor triangles from mesh")
+
+    def extract_floor_boundary_from_triangles(self, floor_triangles):
+        """IMPORT MODE ONLY: Extract ordered 3D boundary points from floor triangle mesh.
+        Returns: (boundary_3d, boundary_xy) where boundary_3d is list of (x,y,z) and boundary_xy is list of (x,y)
+        """
+        if not floor_triangles:
+            return [], []
+        
+        from collections import defaultdict
+        
+        # Build edge-to-triangles map to find boundary edges (edges with only 1 triangle)
+        edge_to_tris = defaultdict(list)
+        for tri_idx, tri in enumerate(floor_triangles):
+            verts = tri['vertices']
+            # Create edges (use sorted tuple to ensure consistent direction)
+            for i in range(3):
+                v1 = tuple(verts[i])
+                v2 = tuple(verts[(i + 1) % 3])
+                edge = tuple(sorted([v1, v2], key=lambda p: (p[0], p[1], p[2])))
+                edge_to_tris[edge].append(tri_idx)
+        
+        # Find boundary edges (appear in exactly 1 triangle)
+        boundary_edges = []
+        for edge, tri_list in edge_to_tris.items():
+            if len(tri_list) == 1:
+                # Store as (v1, v2) preserving order from triangle winding
+                tri = floor_triangles[tri_list[0]]
+                verts = tri['vertices']
+                # Find the edge in the triangle to preserve winding order
+                for i in range(3):
+                    v1_arr = verts[i]
+                    v2_arr = verts[(i + 1) % 3]
+                    v1 = tuple(v1_arr)
+                    v2 = tuple(v2_arr)
+                    if tuple(sorted([v1, v2], key=lambda p: (p[0], p[1], p[2]))) == edge:
+                        boundary_edges.append((v1_arr, v2_arr))
+                        break
+        
+        if not boundary_edges:
+            print("[Boundary Extraction] No boundary edges found")
+            return [], []
+        
+        # Order edges into a boundary loop
+        ordered_points_3d = []
+        edge_dict = {tuple(e[0]): e[1] for e in boundary_edges}
+        
+        # Start from first edge
+        current = boundary_edges[0][0]
+        ordered_points_3d.append(current)
+        visited = {tuple(current)}
+        
+        # Follow the chain
+        max_iterations = len(boundary_edges) * 2
+        for _ in range(max_iterations):
+            current_key = tuple(current)
+            if current_key in edge_dict:
+                next_point = edge_dict[current_key]
+                next_key = tuple(next_point)
+                if next_key in visited:
+                    break  # Loop closed
+                ordered_points_3d.append(next_point)
+                visited.add(next_key)
+                current = next_point
+            else:
+                # Try to find any edge starting from current point
+                found = False
+                for e in boundary_edges:
+                    if tuple(e[0]) == current_key and tuple(e[1]) not in visited:
+                        current = e[1]
+                        ordered_points_3d.append(current)
+                        visited.add(tuple(current))
+                        found = True
+                        break
+                if not found:
+                    break
+        
+        if len(ordered_points_3d) < 3:
+            print(f"[Boundary Extraction] Failed to order boundary loop, got {len(ordered_points_3d)} points")
+            return [], []
+        
+        # Convert to simple lists and extract XY
+        boundary_3d = [(float(p[0]), float(p[1]), float(p[2])) for p in ordered_points_3d]
+        boundary_xy = [(float(p[0]), float(p[1])) for p in ordered_points_3d]
+        
+        print(f"[Boundary Extraction] Extracted {len(boundary_3d)} boundary points from mesh edge")
+        return boundary_3d, boundary_xy
 
     def sample_floor_z(self, x, y):
         """Sample Z coordinate from detected floor triangles at (x, y) using barycentric interpolation."""
@@ -1801,21 +1888,33 @@ class GLWidget(QOpenGLWidget):
         glEnable(GL_LIGHTING); glLineWidth(1.0)
 
     def draw_import_surface_boundary(self):
-        """IMPORT MODE ONLY: Draw boundary of selected surface from imported model."""
-        if not self.import_room_boundary_poly or len(self.import_room_boundary_poly) < 3:
-            return
-        
-        glDisable(GL_LIGHTING)
-        glLineWidth(2.0)
-        glColor3f(0.0, 0.0, 0.0)
-        glBegin(GL_LINE_LOOP)
-        for x, y in self.import_room_boundary_poly:
-            # Sample Z from floor mesh for accurate height
-            z = self.sample_floor_z(x, y) if self.floor_triangles else 0.0
-            glVertex3f(x, y, z + 0.002)
-        glEnd()
-        glEnable(GL_LIGHTING)
-        glLineWidth(1.0)
+        """IMPORT MODE ONLY: Draw boundary of selected surface from imported model.
+        Uses true 3D boundary points from mesh edge if available, preserving uneven Z profile.
+        """
+        # Prefer true 3D boundary points from mesh edge
+        if self.selected_floor_boundary_3d and len(self.selected_floor_boundary_3d) >= 3:
+            glDisable(GL_LIGHTING)
+            glLineWidth(2.0)
+            glColor3f(0.0, 0.0, 0.0)
+            glBegin(GL_LINE_LOOP)
+            for x, y, z in self.selected_floor_boundary_3d:
+                # Use actual Z from mesh edge with small offset to avoid z-fighting
+                glVertex3f(x, y, z + 0.002)
+            glEnd()
+            glEnable(GL_LIGHTING)
+            glLineWidth(1.0)
+        elif self.import_room_boundary_poly and len(self.import_room_boundary_poly) >= 3:
+            # Fallback: use 2D boundary and sample Z
+            glDisable(GL_LIGHTING)
+            glLineWidth(2.0)
+            glColor3f(0.0, 0.0, 0.0)
+            glBegin(GL_LINE_LOOP)
+            for x, y in self.import_room_boundary_poly:
+                z = self.sample_floor_z(x, y) if self.floor_triangles else 0.0
+                glVertex3f(x, y, z + 0.002)
+            glEnd()
+            glEnable(GL_LIGHTING)
+            glLineWidth(1.0)
 
     def draw_imported_mesh(self):
         """Draw the imported 3D model mesh with surface selection highlighting - OPTIMIZED."""
@@ -3614,21 +3713,35 @@ class MainWindow(QMainWindow):
                 
                 # Compute convex hull to get boundary polygon
                 from scipy.spatial import ConvexHull
-                try:
-                    hull = ConvexHull(xy_points)
-                    boundary_polygon = [(xy_points[i, 0], xy_points[i, 1]) for i in hull.vertices]
-                    
-                    # Store boundary for room boundary drawing in import mode
-                    self.gl_widget.import_room_boundary_poly = boundary_polygon
-                    
+                # IMPORT MODE ONLY: Extract true 3D boundary from floor mesh triangles
+                boundary_3d, boundary_xy = self.gl_widget.extract_floor_boundary_from_triangles(
+                    self.gl_widget.floor_triangles
+                )
+                
+                if boundary_3d and boundary_xy:
+                    # Use true mesh boundary
+                    self.gl_widget.selected_floor_boundary_3d = boundary_3d
+                    self.gl_widget.import_room_boundary_poly = boundary_xy
+                    boundary_polygon = boundary_xy
+                    print(f"[DEBUG] Using true mesh boundary: {len(boundary_3d)} points")
+                else:
+                    # Fallback to convex hull if boundary extraction fails
+                    try:
+                        from scipy.spatial import ConvexHull
+                        hull = ConvexHull(xy_points)
+                        boundary_polygon = [(xy_points[i, 0], xy_points[i, 1]) for i in hull.vertices]
+                        self.gl_widget.import_room_boundary_poly = boundary_polygon
+                        self.gl_widget.selected_floor_boundary_3d = []  # No 3D boundary available
+                        print(f"[DEBUG] Fallback to convex hull: {len(boundary_polygon)} points")
+                    except Exception as e:
+                        print(f"[WARNING] Could not compute floor polygon: {e}")
+                        boundary_polygon = []
+                
+                if boundary_polygon:
                     # Update params to use polygon mode
                     params['mode'] = 'polygon'
                     params['polygon'] = boundary_polygon
-                    
-                    print(f"[DEBUG] Extracted floor polygon from {len(selected_faces)} selected faces, {len(boundary_polygon)} boundary points")
-                    
-                except Exception as e:
-                    print(f"[WARNING] Could not compute floor polygon: {e}")
+                    print(f"[DEBUG] Floor polygon ready: {len(boundary_polygon)} boundary points")
         
         self.gl_widget.compute_and_build_layout(params, params['tile'], params['slope'])
 
