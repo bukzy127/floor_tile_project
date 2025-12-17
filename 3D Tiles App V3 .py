@@ -515,6 +515,7 @@ class GLWidget(QOpenGLWidget):
         # Floor detection for uneven-floor pedestal handling
         self.floor_triangles = []
         self._floor_vertices_flat = []
+        self.ceiling_z = None  # Detected ceiling height from imported model
 
         # Visualization toggles
         self.show_wireframe = False
@@ -953,8 +954,19 @@ class GLWidget(QOpenGLWidget):
             self.room_polygon_xy = room_poly
 
         # Determine raised floor Z levels
-        # Treat target_top_z (or room_height) as the desired tile top, compute tile bottom from it
-        target_top_z = room_params_input.get('room_height', room_params_input.get('target_top_z', 0.0))
+        # When ceiling_z is available (from imported model), interpret room_height as HEADROOM (clearance from tile top to ceiling)
+        # Otherwise, treat it as absolute tile top Z coordinate for backward compatibility
+        headroom_or_height = room_params_input.get('room_height', room_params_input.get('target_top_z', 0.4))
+        
+        if self.ceiling_z is not None:
+            # Headroom mode: tile_top_z = ceiling_z - headroom
+            target_top_z = self.ceiling_z - headroom_or_height
+            print(f"[DEBUG] Headroom mode: ceiling_z={self.ceiling_z:.3f}, headroom={headroom_or_height:.3f}, tile_top_z={target_top_z:.3f}")
+        else:
+            # Absolute mode (backward compatibility): tile_top_z = user input
+            target_top_z = headroom_or_height
+            print(f"[DEBUG] Absolute mode: tile_top_z={target_top_z:.3f} (no ceiling detected)")
+        
         actual_tile_top_z = target_top_z
         actual_tile_bottom_z = target_top_z - tile_params['thickness']
         
@@ -2720,7 +2732,7 @@ class MainWindow(QMainWindow):
         raised_g = QGroupBox("Raised Floor Height")
         raised_f = QFormLayout()
         self.room_height_in = QDoubleSpinBox(minimum=0.0, maximum=10.0, value=0.40, decimals=3, singleStep=0.05)
-        self.room_height_in.setToolTip("Finished floor height above the imported surface (meters)")
+        self.room_height_in.setToolTip("Desired clearance from tile surface to ceiling (headroom in meters). When importing a 3D model, ceiling height is detected automatically.")
         self.pedestal_min_height_in = QDoubleSpinBox(minimum=0.0, maximum=1.0, value=0.10, decimals=3, singleStep=0.01)
         self.pedestal_min_height_in.setToolTip("Minimum fixed pedestal base height (meters)")
         
@@ -2735,7 +2747,7 @@ class MainWindow(QMainWindow):
         pedestal_height_layout.addWidget(QLabel("m"))
         pedestal_height_layout.addStretch()
         
-        raised_f.addRow("Desired room height:", room_height_layout)
+        raised_f.addRow("Desired headroom (tile to ceiling):", room_height_layout)
         raised_f.addRow("Pedestal min height:", pedestal_height_layout)
         raised_g.setLayout(raised_f)
         self.control_layout.addWidget(raised_g)
@@ -2938,6 +2950,13 @@ class MainWindow(QMainWindow):
             
             # Extract floor geometry for uneven-floor pedestal support
             self.gl_widget.extract_floor_from_mesh(mesh)
+            
+            # Detect ceiling height (max Z of all vertices)
+            if len(mesh.vertices) > 0:
+                self.gl_widget.ceiling_z = float(np.max(mesh.vertices[:, 2]))
+                print(f"🔍 DEBUG: Detected ceiling_z = {self.gl_widget.ceiling_z:.3f}m from imported model")
+            else:
+                self.gl_widget.ceiling_z = None
             
             # Initialize SurfaceSelector immediately so groups are available for pick/selection
             try:
