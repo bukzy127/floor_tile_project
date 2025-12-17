@@ -737,13 +737,14 @@ class GLWidget(QOpenGLWidget):
 
         return (cx, cy)
 
-    def compute_layout_on_selected_surfaces(self, tile_params, pedestal_height=0.1016):
+    def compute_layout_on_selected_surfaces(self, tile_params, desired_room_height=0.40, pedestal_min_height=0.10):
         """
         Generate tile layout and pedestals ONLY on user-selected surfaces from 3D model.
 
         Args:
             tile_params: Dict with 'width', 'length', 'thickness' in meters
-            pedestal_height: Height of pedestals in meters (default 4 inches = 0.1016m)
+            desired_room_height: Target finished floor height above each imported surface (meters)
+            pedestal_min_height: Fixed base height of pedestals in meters
 
         Returns:
             bool: True if layout was generated successfully, False otherwise
@@ -842,6 +843,14 @@ class GLWidget(QOpenGLWidget):
             # V axis
             v_axis = np.cross(normal, u_axis)
             v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-12)
+
+            # Determine reference height for this surface group
+            group_base_z = float(np.min(verts_coords[:, 2])) if len(verts_coords) else 0.0
+            target_tile_top_z = group_base_z + desired_room_height
+            tile_bottom_z = target_tile_top_z - tile_thickness
+            # Ensure pedestals can never be shorter than the minimum base height
+            tile_bottom_z = max(tile_bottom_z, group_base_z + pedestal_min_height)
+            target_tile_top_z = tile_bottom_z + tile_thickness
 
             # Build boundary loop for the group by finding edges referenced only once in the group
             edge_count = {}
@@ -988,8 +997,6 @@ class GLWidget(QOpenGLWidget):
                         qr_data=f"T-{gid}-{iu}-{jv}"
                     )
 
-                    base_z = min(p[2] for p in polygon_3d)
-                    tile_bottom_z = base_z + pedestal_height
                     tile.corners_bottom_xyz = []
                     tile.corners_top_xyz = []
                     for p in polygon_3d:
@@ -1004,9 +1011,25 @@ class GLWidget(QOpenGLWidget):
                             all_pedestals[key] = {
                                 'pos_xy': (px, py),
                                 'base_z': pz,
-                                'height': pedestal_height,
-                                'radius': pedestal_radius
+                                'height': 0.0,
+                                'radius': pedestal_radius,
+                                'target_bottom_z': tile_bottom_z
                             }
+                        else:
+                            # Keep the tallest target bottom if this location is reused
+                            all_pedestals[key]['target_bottom_z'] = max(
+                                all_pedestals[key].get('target_bottom_z', tile_bottom_z),
+                                tile_bottom_z
+                            )
+
+        # Finalize pedestal heights with adjustable portion
+        for ped in all_pedestals.values():
+            target_bottom = ped.get('target_bottom_z', tile_thickness)
+            computed_height = max(pedestal_min_height, target_bottom - ped['base_z'])
+            ped['min_height'] = pedestal_min_height
+            ped['adjustable_height'] = max(computed_height - pedestal_min_height, 0.0)
+            ped['height'] = computed_height
+            ped['target_top_z'] = target_bottom + tile_thickness
 
         # Store generated tiles and pedestals
         self.tiles = all_tiles
@@ -1748,37 +1771,64 @@ class GLWidget(QOpenGLWidget):
         glPushMatrix()
         glTranslatef(pedestal['pos_xy'][0], pedestal['pos_xy'][1], pedestal['base_z'])
 
-        total_h, cap_r = pedestal['height'], pedestal['radius']
-        BASE_H_F, STEM_H_F, CAP_H_F = 0.10, 0.80, 0.10
-        BASE_R_S, STEM_R_S = 1.0, 0.7
+        total_h = pedestal.get('height', 0.0)
+        base_h = pedestal.get('min_height', 0.0)
+        adjustable_h = pedestal.get('adjustable_height', max(total_h - base_h, 0.0))
+        cap_r = pedestal['radius']
 
         current_z = 0.0
-        # Draw Base with selection highlight
-        base_h, base_r = total_h * BASE_H_F, cap_r * BASE_R_S
-        glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(base_r, base_r, base_h)
-        if is_selected:
-            glColor3f(1.0, 0.7, 0.0)  # Orange highlight for selected
-        else:
-            glColor3f(0.22, 0.22, 0.25)
-        glCallList(self.unit_cylinder_dl); glPopMatrix()
-        current_z += base_h
-        # Draw Stem
-        stem_h, stem_r = total_h * STEM_H_F, cap_r * STEM_R_S
-        glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(stem_r, stem_r, stem_h)
-        if is_selected:
-            glColor3f(1.0, 0.8, 0.1)  # Lighter orange for stem
-        else:
-            glColor3f(0.28, 0.28, 0.31)
-        glCallList(self.unit_cylinder_dl); glPopMatrix()
-        current_z += stem_h
-        # Draw Cap
-        cap_h = total_h * CAP_H_F
-        glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(cap_r, cap_r, cap_h)
-        if is_selected:
-            glColor3f(1.0, 0.9, 0.2)  # Bright orange/yellow for cap
-        else:
-            glColor3f(0.35, 0.35, 0.38)
-        glCallList(self.unit_cylinder_dl); glPopMatrix()
+
+        # Fixed base segment
+        if base_h > EPSILON:
+            base_main = max(base_h * 0.7, 0.003)
+            base_cap = max(base_h - base_main, 0.0)
+            glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(cap_r, cap_r, base_main)
+            if is_selected:
+                glColor3f(1.0, 0.7, 0.0)
+            else:
+                glColor3f(0.20, 0.20, 0.23)
+            glCallList(self.unit_cylinder_dl); glPopMatrix()
+            current_z += base_main
+
+            if base_cap > EPSILON:
+                glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(cap_r * 0.9, cap_r * 0.9, base_cap)
+                if is_selected:
+                    glColor3f(1.0, 0.78, 0.1)
+                else:
+                    glColor3f(0.26, 0.26, 0.30)
+                glCallList(self.unit_cylinder_dl); glPopMatrix()
+                current_z += base_cap
+
+        # Adjustable segment
+        if adjustable_h > EPSILON:
+            adj_main = max(adjustable_h * 0.8, 0.003)
+            adj_cap = max(adjustable_h - adj_main, 0.0)
+            glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(cap_r * 0.75, cap_r * 0.75, adj_main)
+            if is_selected:
+                glColor3f(1.0, 0.82, 0.2)
+            else:
+                glColor3f(0.15, 0.55, 0.65)
+            glCallList(self.unit_cylinder_dl); glPopMatrix()
+            current_z += adj_main
+
+            if adj_cap > EPSILON:
+                glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(cap_r * 0.85, cap_r * 0.85, adj_cap)
+                if is_selected:
+                    glColor3f(1.0, 0.88, 0.3)
+                else:
+                    glColor3f(0.22, 0.65, 0.72)
+                glCallList(self.unit_cylinder_dl); glPopMatrix()
+                current_z += adj_cap
+
+        # Fill any residual height to hit the target total
+        remaining = max(total_h - current_z, 0.0)
+        if remaining > EPSILON:
+            glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(cap_r * 0.9, cap_r * 0.9, remaining)
+            if is_selected:
+                glColor3f(1.0, 0.85, 0.25)
+            else:
+                glColor3f(0.30, 0.30, 0.34)
+            glCallList(self.unit_cylinder_dl); glPopMatrix()
 
         glPopMatrix()
 
@@ -2807,6 +2857,30 @@ class MainWindow(QMainWindow):
         slope_g.setLayout(slope_f)
         self.control_layout.addWidget(slope_g)
 
+        # Raised floor controls
+        raised_g = QGroupBox("Raised Floor Height")
+        raised_f = QFormLayout()
+        self.room_height_in = QDoubleSpinBox(minimum=0.0, maximum=10.0, value=0.40, decimals=3, singleStep=0.05)
+        self.room_height_in.setToolTip("Finished floor height above the imported surface (meters)")
+        self.pedestal_min_height_in = QDoubleSpinBox(minimum=0.0, maximum=1.0, value=0.10, decimals=3, singleStep=0.01)
+        self.pedestal_min_height_in.setToolTip("Minimum fixed pedestal base height (meters)")
+        
+        # Create horizontal layouts with unit labels
+        room_height_layout = QHBoxLayout()
+        room_height_layout.addWidget(self.room_height_in)
+        room_height_layout.addWidget(QLabel("m"))
+        room_height_layout.addStretch()
+        
+        pedestal_height_layout = QHBoxLayout()
+        pedestal_height_layout.addWidget(self.pedestal_min_height_in)
+        pedestal_height_layout.addWidget(QLabel("m"))
+        pedestal_height_layout.addStretch()
+        
+        raised_f.addRow("Desired room height:", room_height_layout)
+        raised_f.addRow("Pedestal min height:", pedestal_height_layout)
+        raised_g.setLayout(raised_f)
+        self.control_layout.addWidget(raised_g)
+
         # QR Code Size Slider
         qrsize_g = QGroupBox("QR Code Size")
         qrsize_f = QFormLayout()
@@ -3535,7 +3609,9 @@ class MainWindow(QMainWindow):
             'elevation_mode': elev_mode,
             'flat_z': self.sbz_in.value() if elev_mode=='flat' else 0.0,
             'tile': {'width':self.tw_in.value(),'length':self.tl_in.value(),'thickness': self.tt_in.value()},
-            'slope': {'base_z':self.sbz_in.value(),'slope_x':self.sx_in.value(),'slope_y': self.sy_in.value()}
+            'slope': {'base_z':self.sbz_in.value(),'slope_x':self.sx_in.value(),'slope_y': self.sy_in.value()},
+            'room_height': self.room_height_in.value(),
+            'pedestal_min_height': self.pedestal_min_height_in.value()
         }
         # visualization toggles
         self.gl_widget.show_wireframe = self.wireframe_cb.isChecked()
@@ -3574,11 +3650,13 @@ class MainWindow(QMainWindow):
 
             # Generate tiles on selected surfaces only
             tile_params = params['tile']
-            pedestal_height = 0.1016  # Default 4 inches
+            desired_room_height = params.get('room_height', 0.40)
+            pedestal_min_height = params.get('pedestal_min_height', 0.10)
 
             success = self.gl_widget.compute_layout_on_selected_surfaces(
                 tile_params,
-                pedestal_height=pedestal_height
+                desired_room_height=desired_room_height,
+                pedestal_min_height=pedestal_min_height
             )
 
             if success:
@@ -3632,13 +3710,19 @@ class MainWindow(QMainWindow):
         # Get height in millimeters
         height_mm = self.gl_widget.get_pedestal_height_mm(pedestal)
         height_cm = height_mm / 10.0
+        min_height_mm = pedestal.get('min_height', 0.0) * 1000.0
+        adjustable_mm = max(height_mm - min_height_mm, 0.0)
 
         # Get pedestal position for additional info
         px, py = pedestal['pos_xy']
         base_z_mm = pedestal['base_z'] * 1000.0
 
         # Format the display text
-        display_text = f"Pedestal Height: {height_mm:.1f} mm ({height_cm:.1f} cm)"
+        display_text = (
+            f"Pedestal Height: {height_mm:.1f} mm ({height_cm:.1f} cm)\n"
+            f"Base segment: {min_height_mm:.1f} mm\n"
+            f"Adjustable segment: {adjustable_mm:.1f} mm"
+        )
 
         # Update label
         self.pedestal_height_panel.setText(display_text)
