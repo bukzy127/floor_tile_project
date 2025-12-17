@@ -3,6 +3,7 @@ PyQt6==6.10.0
 PyOpenGL==3.1.10
 PyOpenGL_accelerate==3.1.10
 matplotlib>=3.0
+scipy>=1.7.0
 # Add other project-specific dependencies here
 qrcode
 ezdxf>=1.0.0

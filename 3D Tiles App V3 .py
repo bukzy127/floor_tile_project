@@ -474,6 +474,7 @@ class GLWidget(QOpenGLWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+       
         self.tiles = []
         self.pedestals = []
         self.original_floor_mesh = []
@@ -511,6 +512,9 @@ class GLWidget(QOpenGLWidget):
         self.hovered_surface = None
         self.surface_selector = None  # Will be initialized when mesh is loaded
 
+        # Floor detection for uneven-floor pedestal handling
+        self.floor_triangles = []
+        self._floor_vertices_flat = []
 
         # Visualization toggles
         self.show_wireframe = False
@@ -636,6 +640,146 @@ class GLWidget(QOpenGLWidget):
         gluPerspective(45.0, w / max(h, 1), 0.1, max(50.0, self.camera_distance * 3.0))
         glMatrixMode(GL_MODELVIEW)
 
+    def extract_floor_from_mesh(self, mesh):
+        """Extract floor triangles from imported 3D mesh for uneven-floor pedestal support."""
+        import numpy as np
+        self.floor_triangles = []
+        self._floor_vertices_flat = []
+        
+        if mesh is None or not hasattr(mesh, 'vertices') or not hasattr(mesh, 'faces'):
+            return
+        
+        vertices = np.array(mesh.vertices, dtype=float)
+        faces = np.array(mesh.faces, dtype=int)
+        
+        if len(vertices) == 0 or len(faces) == 0:
+            return
+        
+        # Compute triangle data: centroids, normals, areas
+        triangles = []
+        for face in faces:
+            if len(face) < 3:
+                continue
+            v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+            centroid = (v0 + v1 + v2) / 3.0
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            normal = np.cross(edge1, edge2)
+            area = np.linalg.norm(normal) / 2.0
+            if area < 1e-9:
+                continue
+            normal = normal / (2.0 * area)
+            triangles.append({
+                'vertices': [v0, v1, v2],
+                'centroid': centroid,
+                'normal': normal,
+                'area': area,
+                'face': face
+            })
+        
+        if not triangles:
+            return
+        
+        # Filter triangles: facing +Z, non-trivial area, in lower Z band
+        z_threshold = 0.85
+        all_z = [t['centroid'][2] for t in triangles]
+        min_z, max_z = min(all_z), max(all_z)
+        z_range = max_z - min_z
+        z_band_threshold = min_z + 0.35 * z_range if z_range > 1e-6 else min_z + 1.0
+        
+        floor_candidates = [
+            t for t in triangles
+            if t['normal'][2] >= z_threshold and t['area'] > 1e-6 and t['centroid'][2] <= z_band_threshold
+        ]
+        
+        if not floor_candidates:
+            return
+        
+        # Build connectivity via shared vertices
+        from collections import defaultdict
+        vertex_to_triangles = defaultdict(list)
+        for i, t in enumerate(floor_candidates):
+            for v_idx in t['face']:
+                vertex_to_triangles[v_idx].append(i)
+        
+        # Find largest connected component using BFS
+        visited = set()
+        components = []
+        for start_idx in range(len(floor_candidates)):
+            if start_idx in visited:
+                continue
+            component = []
+            queue = [start_idx]
+            visited.add(start_idx)
+            while queue:
+                current = queue.pop(0)
+                component.append(current)
+                for v_idx in floor_candidates[current]['face']:
+                    for neighbor_idx in vertex_to_triangles[v_idx]:
+                        if neighbor_idx not in visited:
+                            visited.add(neighbor_idx)
+                            queue.append(neighbor_idx)
+            components.append(component)
+        
+        if not components:
+            return
+        
+        largest_component = max(components, key=len)
+        self.floor_triangles = [floor_candidates[i] for i in largest_component]
+        
+        # Build flat list of floor vertices for fallback
+        unique_verts = set()
+        for t in self.floor_triangles:
+            for v in t['vertices']:
+                unique_verts.add(tuple(v))
+        self._floor_vertices_flat = [np.array(v) for v in unique_verts]
+        
+        print(f"[Floor Detection] Extracted {len(self.floor_triangles)} floor triangles from mesh")
+
+    def sample_floor_z(self, x, y):
+        """Sample Z coordinate from detected floor triangles at (x, y) using barycentric interpolation."""
+        import numpy as np
+        
+        # If no floor detected, fall back to original slope function
+        if not self.floor_triangles:
+            return self.original_slope_func(x, y)
+        
+        # Try barycentric containment on each triangle
+        for tri in self.floor_triangles:
+            v0, v1, v2 = tri['vertices']
+            # 2D barycentric coords
+            x0, y0, z0 = v0[0], v0[1], v0[2]
+            x1, y1, z1 = v1[0], v1[1], v1[2]
+            x2, y2, z2 = v2[0], v2[1], v2[2]
+            
+            denom = (y1 - y2)*(x0 - x2) + (x2 - x1)*(y0 - y2)
+            if abs(denom) < 1e-9:
+                continue
+            
+            w0 = ((y1 - y2)*(x - x2) + (x2 - x1)*(y - y2)) / denom
+            w1 = ((y2 - y0)*(x - x2) + (x0 - x2)*(y - y2)) / denom
+            w2 = 1.0 - w0 - w1
+            
+            # Check if point is inside triangle
+            if w0 >= -1e-6 and w1 >= -1e-6 and w2 >= -1e-6:
+                # Interpolate Z
+                z = w0 * z0 + w1 * z1 + w2 * z2
+                return z
+        
+        # Fallback: nearest floor vertex
+        if self._floor_vertices_flat:
+            min_dist_sq = float('inf')
+            nearest_z = 0.0
+            for v in self._floor_vertices_flat:
+                dist_sq = (v[0] - x)**2 + (v[1] - y)**2
+                if dist_sq < min_dist_sq:
+                    min_dist_sq = dist_sq
+                    nearest_z = v[2]
+            return nearest_z
+        
+        # Final fallback
+        return self.original_slope_func(x, y)
+
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
@@ -737,327 +881,6 @@ class GLWidget(QOpenGLWidget):
 
         return (cx, cy)
 
-    def compute_layout_on_selected_surfaces(self, tile_params, desired_room_height=0.40, pedestal_min_height=0.10):
-        """
-        Generate tile layout and pedestals ONLY on user-selected surfaces from 3D model.
-
-        Args:
-            tile_params: Dict with 'width', 'length', 'thickness' in meters
-            desired_room_height: Target finished floor height above each imported surface (meters)
-            pedestal_min_height: Fixed base height of pedestals in meters
-
-        Returns:
-            bool: True if layout was generated successfully, False otherwise
-        """
-        # Validate that we have selected surfaces
-        if not self.selected_surfaces:
-            return False
-
-        if self.imported_mesh is None:
-            return False
-
-        mesh = self.imported_mesh
-
-        # Clear existing tiles and pedestals
-        self.tiles.clear()
-        self.pedestals.clear()
-        self.selected_tile_index = -1
-
-        tile_width = tile_params.get('width', 0.3048)   # Default 12 inches
-        tile_length = tile_params.get('length', 0.3048)  # Default 12 inches
-        tile_thickness = tile_params.get('thickness', 0.02)
-        pedestal_radius = 0.035  # Pedestal cap radius
-
-        all_tiles = []
-        all_pedestals = {}
-
-        # Group-based processing: convert selected face indices into logical surface groups
-        selector = getattr(self, 'surface_selector', None)
-        selected_faces = [f for f in self.selected_surfaces if f < len(mesh.faces)]
-
-        # Build mapping: group_id -> set of face indices
-        groups_map = {}
-        if selector is not None:
-            for f in selected_faces:
-                gid = selector.get_group_id_for_face(f)
-                if gid is None:
-                    # treat as singleton group
-                    key = f"_face_{f}"
-                    groups_map.setdefault(key, set()).add(f)
-                else:
-                    groups_map.setdefault(gid, set()).update(selector.get_group_faces(f))
-        else:
-            # Fallback: each face is its own group
-            for f in selected_faces:
-                groups_map.setdefault(f, set()).add(f)
-
-        # Process each logical group once
-        for gid, faces in groups_map.items():
-            faces = sorted(set(faces))
-            if not faces:
-                continue
-
-            # Collect unique vertex indices used by the group's faces
-            face_array = np.asarray(mesh.faces)
-            group_vids = np.unique(face_array[faces].flatten())
-            verts_coords = np.asarray(mesh.vertices)[group_vids]
-
-            # Compute group centroid and robust average normal
-            centroid = np.mean(verts_coords, axis=0)
-            if hasattr(mesh, 'face_normals') and mesh.face_normals is not None:
-                normals = np.asarray(mesh.face_normals)[faces]
-                normal = np.mean(normals, axis=0)
-                nlen = np.linalg.norm(normal)
-                if nlen > EPSILON:
-                    normal = normal / nlen
-                else:
-                    normal = np.array([0.0, 0.0, 1.0])
-            else:
-                # PCA normal fallback
-                cov = np.cov((verts_coords - centroid).T)
-                eigvals, eigvecs = np.linalg.eigh(cov)
-                normal = eigvecs[:, np.argmin(eigvals)]
-
-            # Determine a stable U axis: choose the longest edge among group's faces
-            longest = 0.0
-            u_axis = None
-            for fi in faces:
-                f = mesh.faces[fi]
-                for k in range(len(f)):
-                    a = np.asarray(mesh.vertices[int(f[k])])
-                    b = np.asarray(mesh.vertices[int(f[(k + 1) % len(f)])])
-                    edge = b - a
-                    l = np.linalg.norm(edge)
-                    if l > longest and l > EPSILON:
-                        longest = l
-                        u_axis = edge / l
-            if u_axis is None:
-                # fallback: any vector perpendicular to normal
-                u_axis = np.array([1.0, 0.0, 0.0])
-                if abs(np.dot(u_axis, normal)) > 0.9:
-                    u_axis = np.array([0.0, 1.0, 0.0])
-                # make perpendicular
-                u_axis = u_axis - normal * np.dot(u_axis, normal)
-                u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-12)
-
-            # V axis
-            v_axis = np.cross(normal, u_axis)
-            v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-12)
-
-            # Determine reference height for this surface group
-            group_base_z = float(np.min(verts_coords[:, 2])) if len(verts_coords) else 0.0
-            target_tile_top_z = group_base_z + desired_room_height
-            tile_bottom_z = target_tile_top_z - tile_thickness
-            # Ensure pedestals can never be shorter than the minimum base height
-            tile_bottom_z = max(tile_bottom_z, group_base_z + pedestal_min_height)
-            target_tile_top_z = tile_bottom_z + tile_thickness
-
-            # Build boundary loop for the group by finding edges referenced only once in the group
-            edge_count = {}
-            edge_dir = {}
-            for fi in faces:
-                f = mesh.faces[fi]
-                for k in range(len(f)):
-                    a = int(f[k]); b = int(f[(k + 1) % len(f)])
-                    key = (min(a, b), max(a, b))
-                    edge_count[key] = edge_count.get(key, 0) + 1
-                    # store directed occurrence for orientation
-                    if key not in edge_dir:
-                        edge_dir[key] = (a, b)
-
-            boundary_edges = [edge_dir[k] for k, c in edge_count.items() if c == 1]
-            if not boundary_edges:
-                # Fallback: if no boundary edges (e.g., closed shell or fully internal region),
-                # create a projected convex hull from the group's vertex set in UV space.
-                # This produces a reasonable tiling boundary for enclosed planar regions.
-                # Project all group vertices into UV
-                all_vids = group_vids
-                pts_uv = []
-                for vid in all_vids:
-                    p3 = np.asarray(mesh.vertices[int(vid)])
-                    rel = p3 - centroid
-                    u = float(np.dot(rel, u_axis)); v = float(np.dot(rel, v_axis))
-                    pts_uv.append((u, v, int(vid)))
-
-                # Monotone chain convex hull on 2D (u,v)
-                def _convex_hull_2d(points):
-                    pts = sorted(points, key=lambda x: (x[0], x[1]))
-                    if len(pts) <= 2:
-                        return [p[2] for p in pts]
-                    def cross(o, a, b):
-                        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
-                    lower = []
-                    for p in pts:
-                        while len(lower) >= 2 and cross((lower[-2][0], lower[-2][1]), (lower[-1][0], lower[-1][1]), (p[0], p[1])) <= 0:
-                            lower.pop()
-                        lower.append(p)
-                    upper = []
-                    for p in reversed(pts):
-                        while len(upper) >= 2 and cross((upper[-2][0], upper[-2][1]), (upper[-1][0], upper[-1][1]), (p[0], p[1])) <= 0:
-                            upper.pop()
-                        upper.append(p)
-                    hull = lower[:-1] + upper[:-1]
-                    return [p[2] for p in hull]
-
-                hull_vids = _convex_hull_2d(pts_uv)
-                if not hull_vids or len(hull_vids) < 3:
-                    # still nothing to tile
-                    continue
-                # Build ordered loop from hull_vids
-                loop = hull_vids
-            else:
-                # Build undirected adjacency of boundary vertices and walk to form ordered loop
-                b_adj = {}
-                for a, b in boundary_edges:
-                    b_adj.setdefault(a, []).append(b)
-                    b_adj.setdefault(b, []).append(a)
-
-                # pick start: prefer a vertex with degree 1 (open boundary), otherwise arbitrary
-                start = None
-                for v, nbrs in b_adj.items():
-                    if len(nbrs) == 1:
-                        start = v; break
-                if start is None:
-                    start = boundary_edges[0][0]
-
-                loop = []
-                used_vertices = set()
-                prev = None
-                cur = start
-                while True:
-                    loop.append(cur)
-                    used_vertices.add(cur)
-                    nbrs = b_adj.get(cur, [])
-                    nxt = None
-                    for n in nbrs:
-                        if n == prev:
-                            continue
-                        nxt = n; break
-                    prev = cur
-                    if nxt is None:
-                        break
-                    cur = nxt
-                    if cur == start:
-                        break
-
-            if len(loop) < 3:
-                continue
-
-            # Project loop vertices to UV coordinates
-            vertices_2d = []
-            loop_coords_3d = [np.asarray(mesh.vertices[int(vid)]) for vid in loop]
-            for p in loop_coords_3d:
-                rel = p - centroid
-                u = float(np.dot(rel, u_axis))
-                v = float(np.dot(rel, v_axis))
-                vertices_2d.append((u, v))
-
-            # Determine bounds and grid in UV space
-            us = [p[0] for p in vertices_2d]
-            vs = [p[1] for p in vertices_2d]
-            min_u, max_u = min(us), max(us)
-            min_v, max_v = min(vs), max(vs)
-
-            surface_width = max_u - min_u
-            surface_height = max_v - min_v
-
-            num_tiles_u = max(1, int(np.ceil(surface_width / tile_width)))
-            num_tiles_v = max(1, int(np.ceil(surface_height / tile_length)))
-
-            for iu in range(num_tiles_u):
-                for jv in range(num_tiles_v):
-                    tile_u = min_u + iu * tile_width
-                    tile_v = min_v + jv * tile_length
-                    tile_rect = [
-                        (tile_u, tile_v),
-                        (tile_u + tile_width, tile_v),
-                        (tile_u + tile_width, tile_v + tile_length),
-                        (tile_u, tile_v + tile_length)
-                    ]
-                    clipped = sutherland_hodgman_clip(vertices_2d, tile_rect)
-                    if not clipped or polygon_area_2d(clipped) < (tile_width * tile_length) * 0.01:
-                        continue
-
-                    # Convert clipped polygon back to 3D world coordinates
-                    polygon_3d = []
-                    for uv in clipped:
-                        world_pos = centroid + uv[0] * u_axis + uv[1] * v_axis
-                        polygon_3d.append((float(world_pos[0]), float(world_pos[1]), float(world_pos[2])))
-
-                    footprint_xy = [(p[0], p[1]) for p in polygon_3d]
-                    is_cut = abs(polygon_area_2d(clipped) - (tile_width * tile_length)) > EPSILON
-
-                    tile = Tile3D(
-                        origin_xy=(tile_u, tile_v),
-                        xtile=tile_width,
-                        ytile=tile_length,
-                        thickness=tile_thickness,
-                        is_cut=is_cut,
-                        cut_polygon_xy=footprint_xy,
-                        qr_data=f"T-{gid}-{iu}-{jv}"
-                    )
-
-                    tile.corners_bottom_xyz = []
-                    tile.corners_top_xyz = []
-                    for p in polygon_3d:
-                        tile.corners_bottom_xyz.append(QVector3D(p[0], p[1], tile_bottom_z))
-                        tile.corners_top_xyz.append(QVector3D(p[0], p[1], tile_bottom_z + tile_thickness))
-                    tile.prepare_pick_geometry()
-
-                    all_tiles.append(tile)
-                    for px, py, pz in polygon_3d:
-                        key = (round(px, 4), round(py, 4))
-                        if key not in all_pedestals:
-                            all_pedestals[key] = {
-                                'pos_xy': (px, py),
-                                'base_z': pz,
-                                'height': 0.0,
-                                'radius': pedestal_radius,
-                                'target_bottom_z': tile_bottom_z
-                            }
-                        else:
-                            # Keep the tallest target bottom if this location is reused
-                            all_pedestals[key]['target_bottom_z'] = max(
-                                all_pedestals[key].get('target_bottom_z', tile_bottom_z),
-                                tile_bottom_z
-                            )
-
-        # Finalize pedestal heights with adjustable portion
-        for ped in all_pedestals.values():
-            target_bottom = ped.get('target_bottom_z', tile_thickness)
-            computed_height = max(pedestal_min_height, target_bottom - ped['base_z'])
-            ped['min_height'] = pedestal_min_height
-            ped['adjustable_height'] = max(computed_height - pedestal_min_height, 0.0)
-            ped['height'] = computed_height
-            ped['target_top_z'] = target_bottom + tile_thickness
-
-        # Store generated tiles and pedestals
-        self.tiles = all_tiles
-        self.pedestals = list(all_pedestals.values())
-
-        # Update room dimensions for camera
-        if all_tiles:
-            all_x = []
-            all_y = []
-            all_z = []
-            for tile in all_tiles:
-                for corner in tile.corners_top_xyz:
-                    all_x.append(corner.x())
-                    all_y.append(corner.y())
-                    all_z.append(corner.z())
-
-            if all_x:
-                width = max(all_x) - min(all_x)
-                length = max(all_y) - min(all_y)
-                center_x = (max(all_x) + min(all_x)) / 2
-                center_y = (max(all_y) + min(all_y)) / 2
-                center_z = (max(all_z) + min(all_z)) / 2
-
-                self.room_dims = {'width': width, 'length': length, 'target_top_z': max(all_z)}
-                self._update_camera_target(width, length, max(all_z))
-
-        return True
-
     def compute_and_build_layout(self, room_params_input, tile_params, slope_params):
         """Main layout algorithm updated to support polygonal rooms and irregular elevation models.
         room_params_input should include keys:
@@ -1074,6 +897,8 @@ class GLWidget(QOpenGLWidget):
         room_polygon = room_params_input.get('polygon', [])
         rw_param = room_params_input.get('width', 0.0)
         rl_param = room_params_input.get('length', 0.0)
+        
+        print(f"[DEBUG] Room setup: mode={room_mode}, width={rw_param:.3f}, length={rl_param:.3f}, polygon_points={len(room_polygon)}")
 
         # configure elevation model
         elev_mode = room_params_input.get('elevation_mode', 'flat')
@@ -1093,6 +918,18 @@ class GLWidget(QOpenGLWidget):
 
         # Determine effective room polygon and bounds
         origin_x = 0.0; origin_y = 0.0
+        
+        # Check if we're in file/import mode without selected surfaces
+        if room_mode == 'file' and not room_polygon:
+            # File mode but no surfaces selected - don't generate default room
+            print("[DEBUG] File/import mode active but no surfaces selected - skipping tile generation")
+            self.tiles.clear()
+            self.pedestals.clear()
+            self.room_polygon_xy = []
+            self.room_dims = {'width': 0.0, 'length': 0.0, 'target_top_z': 0.0}
+            self.update()
+            return
+        
         if room_mode == 'manual' or not room_polygon:
             room_poly = [(0.0,0.0),(rw_param,0.0),(rw_param,rl_param),(0.0,rl_param)]
             area_room = rw_param * rl_param
@@ -1116,12 +953,12 @@ class GLWidget(QOpenGLWidget):
             self.room_polygon_xy = room_poly
 
         # Determine raised floor Z levels
-        min_required_clearance = 0.1
-        # sample four corners of bounding box for max subfloor (use world coords)
-        subfloor_corners_z = [self.original_slope_func(origin_x, origin_y), self.original_slope_func(origin_x + rw_param, origin_y), self.original_slope_func(origin_x, origin_y + rl_param), self.original_slope_func(origin_x + rw_param, origin_y + rl_param)]
-        max_subfloor_z_in_room = max(subfloor_corners_z)
-        actual_tile_bottom_z = max(room_params_input.get('target_top_z', 0.0) - tile_params['thickness'], max_subfloor_z_in_room + min_required_clearance)
-        actual_tile_top_z = actual_tile_bottom_z + tile_params['thickness']
+        # Treat target_top_z (or room_height) as the desired tile top, compute tile bottom from it
+        target_top_z = room_params_input.get('room_height', room_params_input.get('target_top_z', 0.0))
+        actual_tile_top_z = target_top_z
+        actual_tile_bottom_z = target_top_z - tile_params['thickness']
+        
+        print(f"[DEBUG] Tile heights: target_top_z={target_top_z:.3f}, tile_bottom_z={actual_tile_bottom_z:.3f}, thickness={tile_params['thickness']:.3f}")
 
         self.room_dims = {'width': rw_param, 'length': rl_param, 'target_top_z': actual_tile_top_z}
         # update camera target using world center
@@ -1205,13 +1042,28 @@ class GLWidget(QOpenGLWidget):
 
         # 2. Add Type 3 pedestals first
         final_pedestals_map = {}
+        rejected_count = 0
         for key, data in logical_pedestals.items():
             if data['type'] == 3:
                 px, py = data['pos']
-                base_z = self.original_slope_func(px, py)
+                base_z = self.sample_floor_z(px, py)
                 height = actual_tile_bottom_z - base_z
                 if height >= min_pedestal_height:
                     final_pedestals_map[key] = {'pos_xy': (px, py), 'base_z': base_z, 'height': height, 'radius': pedestal_cap_radius}
+                else:
+                    rejected_count += 1
+        
+        print(f"[DEBUG] Type 3 pedestals: {len([d for d in logical_pedestals.values() if d['type']==3])} attempted, {len([p for p in final_pedestals_map.values()])} added, {rejected_count} rejected (height < {min_pedestal_height})")
+        if rejected_count > 0:
+            # Sample one rejected pedestal to show why
+            for key, data in logical_pedestals.items():
+                if data['type'] == 3:
+                    px, py = data['pos']
+                    base_z = self.sample_floor_z(px, py)
+                    height = actual_tile_bottom_z - base_z
+                    if height < min_pedestal_height:
+                        print(f"[DEBUG] Sample rejected pedestal: pos=({px:.3f},{py:.3f}), base_z={base_z:.3f}, tile_bottom={actual_tile_bottom_z:.3f}, height={height:.3f}")
+                        break
 
         # 3. Add adjusted Type 1 & 2 pedestals, checking for collision
         type3_positions = [p['pos_xy'] for p in final_pedestals_map.values()]
@@ -1278,7 +1130,7 @@ class GLWidget(QOpenGLWidget):
                 is_colliding = any(((adj_px - p3[0])**2 + (adj_py - p3[1])**2) < min_dist_sq for p3 in type3_positions)
 
                 if not is_colliding:
-                    base_z = self.original_slope_func(adj_px, adj_py)
+                    base_z = self.sample_floor_z(adj_px, adj_py)
                     height = actual_tile_bottom_z - base_z
                     if height >= min_pedestal_height:
                         final_pedestals_map[key] = {'pos_xy': (adj_px, adj_py), 'base_z': base_z, 'height': height, 'radius': pedestal_cap_radius}
@@ -1456,6 +1308,14 @@ class GLWidget(QOpenGLWidget):
             is_supported = all((round(cx, 4), round(cy, 4)) in supported_corners_keys for cx, cy in tile.get_actual_xy_footprint())
             if is_supported:
                 self.tiles.append(tile)
+        
+        print(f"[DEBUG] Tiles: {len(initial_tiles)} initial, {len(self.tiles)} supported, {len(self.pedestals)} pedestals")
+        if len(self.tiles) == 0 and len(initial_tiles) > 0:
+            # Check why tiles were rejected
+            sample_tile = initial_tiles[0]
+            corners = sample_tile.get_actual_xy_footprint()
+            print(f"[DEBUG] Sample tile corners: {[(round(cx,4), round(cy,4)) for cx,cy in corners]}")
+            print(f"[DEBUG] Available pedestal corners: {list(supported_corners_keys)[:10]}...")
 
         # Generate floor mesh for drawing (same as before but use elevation model z)
         # Only generate a floor mesh if the room has non-zero dimensions.
@@ -2770,9 +2630,9 @@ class MainWindow(QMainWindow):
 
         room_g = QGroupBox("Room Dimensions (meters)")
         room_f = QFormLayout()
-        self.rw_in=QDoubleSpinBox(minimum=0.0,maximum=100,value=0.0,decimals=2,singleStep=0.1)
-        self.rl_in=QDoubleSpinBox(minimum=0.0,maximum=100,value=0.0,decimals=2,singleStep=0.1)
-        self.r_ttz_in=QDoubleSpinBox(minimum=-10,maximum=10,value=0.0,decimals=2,singleStep=0.05)
+        self.rw_in=QDoubleSpinBox(minimum=0.0,maximum=100,value=5.0,decimals=2,singleStep=0.1)
+        self.rl_in=QDoubleSpinBox(minimum=0.0,maximum=100,value=4.0,decimals=2,singleStep=0.1)
+        self.r_ttz_in=QDoubleSpinBox(minimum=-10,maximum=10,value=0.15,decimals=2,singleStep=0.05)
         room_f.addRow("Width:",self.rw_in); room_f.addRow("Length:",self.rl_in)
         room_f.addRow("Target Tile Top Z:", self.r_ttz_in)
         room_g.setLayout(room_f); self.control_layout.addWidget(room_g)
@@ -2854,8 +2714,7 @@ class MainWindow(QMainWindow):
         self.import_elev_btn.clicked.connect(self.import_elevation_file)
         slope_f.addRow("Elevation Mode:", self.elev_mode_cb)
         slope_f.addRow(self.import_elev_btn)
-        slope_g.setLayout(slope_f)
-        self.control_layout.addWidget(slope_g)
+        slope_g.setLayout(slope_f); self.control_layout.addWidget(slope_g)
 
         # Raised floor controls
         raised_g = QGroupBox("Raised Floor Height")
@@ -3076,6 +2935,10 @@ class MainWindow(QMainWindow):
 
             # Store the mesh in GL widget
             self.gl_widget.imported_mesh = mesh
+            
+            # Extract floor geometry for uneven-floor pedestal support
+            self.gl_widget.extract_floor_from_mesh(mesh)
+            
             # Initialize SurfaceSelector immediately so groups are available for pick/selection
             try:
                 self.gl_widget.surface_selector = SurfaceSelector(mesh)
@@ -3627,69 +3490,47 @@ class MainWindow(QMainWindow):
         ONLY on those surfaces. Otherwise uses standard room-based layout.
         """
         params = self.get_parameters()
-
-        # Check if we have selected surfaces from a 3D model
-        if (self.gl_widget.selected_surfaces and
-            self.gl_widget.imported_mesh is not None):
-
-            # Validate selection
-            valid_surfaces = [idx for idx in self.gl_widget.selected_surfaces
-                            if idx < len(self.gl_widget.imported_mesh.faces)]
-
-            if not valid_surfaces:
-                QMessageBox.warning(
-                    self,
-                    "Invalid Selection",
-                    "No valid surfaces selected.\n\n"
-                    "Please select surfaces from the 3D model first:\n"
-                    "1. Click 'Select Surface for Tiling'\n"
-                    "2. Click on surfaces (Ctrl+click for multi-select)\n"
-                    "3. Click 'Compute and Visualize Layout' to generate tiles."
-                )
-                return
-
-            # Generate tiles on selected surfaces only
-            tile_params = params['tile']
-            desired_room_height = params.get('room_height', 0.40)
-            pedestal_min_height = params.get('pedestal_min_height', 0.10)
-
-            success = self.gl_widget.compute_layout_on_selected_surfaces(
-                tile_params,
-                desired_room_height=desired_room_height,
-                pedestal_min_height=pedestal_min_height
-            )
-
-            if success:
-                tile_count = len(self.gl_widget.tiles)
-                ped_count = len(self.gl_widget.pedestals)
-                surface_count = len(valid_surfaces)
-
-                # Update status
-                self.surface_info_label.setText(
-                    f"✓ Layout: {tile_count} tiles, {ped_count} pedestals on {surface_count} surface(s)"
-                )
-                self.surface_info_label.setStyleSheet("color: green; font-size: 9pt; font-weight: bold;")
-
-                QMessageBox.information(
-                    self,
-                    "Layout Generated",
-                    f"Successfully generated tile layout:\n\n"
-                    f"• {tile_count} tiles\n"
-                    f"• {ped_count} pedestals\n"
-                    f"• {surface_count} surface(s)\n\n"
-                    f"Tiles and pedestals have been placed on the selected surfaces."
-                )
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Layout Generation Failed",
-                    "Could not generate tile layout on selected surfaces.\n\n"
-                    "Please ensure valid surfaces are selected."
-                )
-                return
-        else:
-            # Standard room-based layout (no surfaces selected)
-            self.gl_widget.compute_and_build_layout(params, params['tile'], params['slope'])
+        
+        # If surfaces are selected from imported 3D model, extract floor polygon
+        if (self.gl_widget.imported_mesh is not None and 
+            self.gl_widget.selected_surfaces):
+            
+            import numpy as np
+            mesh = self.gl_widget.imported_mesh
+            selected_faces = list(self.gl_widget.selected_surfaces)
+            
+            # Extract all vertices from selected faces
+            all_vertices = []
+            for face_idx in selected_faces:
+                if face_idx < len(mesh.faces):
+                    face = mesh.faces[face_idx]
+                    for vertex_idx in face:
+                        if vertex_idx < len(mesh.vertices):
+                            v = mesh.vertices[vertex_idx]
+                            all_vertices.append([v[0], v[1], v[2]])
+            
+            if all_vertices:
+                vertices_array = np.array(all_vertices)
+                
+                # Project to XY plane and find boundary
+                xy_points = vertices_array[:, :2]
+                
+                # Compute convex hull to get boundary polygon
+                from scipy.spatial import ConvexHull
+                try:
+                    hull = ConvexHull(xy_points)
+                    boundary_polygon = [(xy_points[i, 0], xy_points[i, 1]) for i in hull.vertices]
+                    
+                    # Update params to use polygon mode
+                    params['mode'] = 'polygon'
+                    params['polygon'] = boundary_polygon
+                    
+                    print(f"[DEBUG] Extracted floor polygon from {len(selected_faces)} selected faces, {len(boundary_polygon)} boundary points")
+                    
+                except Exception as e:
+                    print(f"[WARNING] Could not compute floor polygon: {e}")
+        
+        self.gl_widget.compute_and_build_layout(params, params['tile'], params['slope'])
 
         # Refresh the 3D view
         self.gl_widget.update()
