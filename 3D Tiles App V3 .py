@@ -517,6 +517,7 @@ class GLWidget(QOpenGLWidget):
         self._floor_vertices_flat = []
         self.ceiling_z = None  # Detected ceiling height from imported model
         self.has_imported_model = False  # Flag to prevent default floor rendering in import mode
+        self.import_room_boundary_poly = []  # Boundary polygon from selected surface in import mode
 
         # Visualization toggles
         self.show_wireframe = False
@@ -810,14 +811,21 @@ class GLWidget(QOpenGLWidget):
         except Exception:
             self._cached_modelview = self._cached_projection = self._cached_viewport = None
 
-        if self.show_elevation_map:
-            # Draw elevation heatmap under tiles
-            self.draw_elevation_heatmap()
-        else:
-            self.draw_original_floor()
+        # IMPORT MODE ONLY: Skip default floor/elevation rendering when 3D model is imported
+        if not self.has_imported_model:
+            if self.show_elevation_map:
+                # Draw elevation heatmap under tiles
+                self.draw_elevation_heatmap()
+            else:
+                self.draw_original_floor()
 
-        # Draw room polygon boundary if available
-        self.draw_room_boundary()
+        # IMPORT MODE ONLY: Skip default room boundary when 3D model is imported
+        if not self.has_imported_model:
+            # Draw room polygon boundary if available
+            self.draw_room_boundary()
+        elif self.import_room_boundary_poly:
+            # IMPORT MODE ONLY: Draw boundary from selected surface
+            self.draw_import_surface_boundary()
 
         for i, ped in enumerate(self.pedestals):
             self.draw_pedestal(ped, is_selected=(i == self.selected_pedestal_index))
@@ -882,6 +890,33 @@ class GLWidget(QOpenGLWidget):
                            attempt_pos[1] - dir_y * (ped_radius * 0.4))
 
         return (cx, cy)
+
+    def reset_scene_for_import(self):
+        """IMPORT MODE ONLY: Clear ALL previous/default floor-plan visualization state.
+        Called immediately after successful 3D model import to ensure only imported geometry is visible.
+        """
+        # Clear tile and pedestal geometry
+        self.tiles.clear()
+        self.pedestals.clear()
+        
+        # Clear default floor mesh
+        self.original_floor_mesh.clear()
+        
+        # Clear room boundary state from default mode
+        self.room_polygon_xy = []
+        
+        # Clear selection state from default mode
+        self.selected_tile_index = -1
+        self.selected_pedestal_index = -1
+        
+        # Clear elevation model if it was loaded
+        if hasattr(self, 'elevation_model'):
+            self.elevation_model.points = []
+        
+        # Reset room dimensions to zero
+        self.room_dims = {'width': 0.0, 'length': 0.0, 'target_top_z': 0.0}
+        
+        print("[DEBUG] Scene reset for import: cleared all default visualization state")
 
     def compute_and_build_layout(self, room_params_input, tile_params, slope_params):
         """Main layout algorithm updated to support polygonal rooms and irregular elevation models.
@@ -955,18 +990,19 @@ class GLWidget(QOpenGLWidget):
             self.room_polygon_xy = room_poly
 
         # Determine raised floor Z levels
-        # When ceiling_z is available (from imported model), interpret room_height as HEADROOM (clearance from tile top to ceiling)
-        # Otherwise, treat it as absolute tile top Z coordinate for backward compatibility
+        # IMPORT MODE ONLY: When ceiling_z is available (from imported 3D model), interpret room_height as HEADROOM
+        # (clearance from tile top to ceiling). Otherwise, treat it as absolute tile top Z coordinate (default/manual mode).
         headroom_or_height = room_params_input.get('room_height', room_params_input.get('target_top_z', 0.4))
         
+        # IMPORT MODE ONLY: ceiling_z is only set when a 3D model is imported
         if self.ceiling_z is not None:
-            # Headroom mode: tile_top_z = ceiling_z - headroom
+            # IMPORT MODE: Headroom-based calculation: tile_top_z = ceiling_z - headroom
             target_top_z = self.ceiling_z - headroom_or_height
-            print(f"[DEBUG] Headroom mode: ceiling_z={self.ceiling_z:.3f}, headroom={headroom_or_height:.3f}, tile_top_z={target_top_z:.3f}")
+            print(f"[DEBUG] IMPORT MODE - Headroom mode: ceiling_z={self.ceiling_z:.3f}, headroom={headroom_or_height:.3f}, tile_top_z={target_top_z:.3f}")
         else:
-            # Absolute mode (backward compatibility): tile_top_z = user input
+            # DEFAULT/MANUAL MODE: Absolute tile height (unchanged from original behavior)
             target_top_z = headroom_or_height
-            print(f"[DEBUG] Absolute mode: tile_top_z={target_top_z:.3f} (no ceiling detected)")
+            print(f"[DEBUG] DEFAULT MODE - Absolute mode: tile_top_z={target_top_z:.3f} (no ceiling detected)")
         
         actual_tile_top_z = target_top_z
         actual_tile_bottom_z = target_top_z - tile_params['thickness']
@@ -1747,15 +1783,39 @@ class GLWidget(QOpenGLWidget):
             glEnd()
 
     def draw_room_boundary(self):
-        if not self.room_polygon_xy or len(self.room_polygon_xy) < 3: return
+        # Use import boundary if available (from selected surface), otherwise use room_polygon_xy
+        boundary_to_draw = self.import_room_boundary_poly if (self.has_imported_model and self.import_room_boundary_poly) else self.room_polygon_xy
+        
+        if not boundary_to_draw or len(boundary_to_draw) < 3: return
         glDisable(GL_LIGHTING); glLineWidth(2.0)
         glColor3f(0.0, 0.0, 0.0)
         glBegin(GL_LINE_LOOP)
-        for x,y in self.room_polygon_xy:
-            z = self.original_slope_func(x,y)
+        for x,y in boundary_to_draw:
+            # In import mode with floor triangles, sample Z from mesh; otherwise use slope function
+            if self.has_imported_model and self.floor_triangles:
+                z = self.sample_floor_z(x, y)
+            else:
+                z = self.original_slope_func(x, y)
             glVertex3f(x, y, z + 0.002)
         glEnd()
         glEnable(GL_LIGHTING); glLineWidth(1.0)
+
+    def draw_import_surface_boundary(self):
+        """IMPORT MODE ONLY: Draw boundary of selected surface from imported model."""
+        if not self.import_room_boundary_poly or len(self.import_room_boundary_poly) < 3:
+            return
+        
+        glDisable(GL_LIGHTING)
+        glLineWidth(2.0)
+        glColor3f(0.0, 0.0, 0.0)
+        glBegin(GL_LINE_LOOP)
+        for x, y in self.import_room_boundary_poly:
+            # Sample Z from floor mesh for accurate height
+            z = self.sample_floor_z(x, y) if self.floor_triangles else 0.0
+            glVertex3f(x, y, z + 0.002)
+        glEnd()
+        glEnable(GL_LIGHTING)
+        glLineWidth(1.0)
 
     def draw_imported_mesh(self):
         """Draw the imported 3D model mesh with surface selection highlighting - OPTIMIZED."""
@@ -2738,6 +2798,7 @@ class MainWindow(QMainWindow):
         # Raised floor controls
         raised_g = QGroupBox("Raised Floor Height")
         raised_f = QFormLayout()
+        # Default 0.40m for manual mode; will be set to 2.0m when switching to Import 3D Model mode
         self.room_height_in = QDoubleSpinBox(minimum=0.0, maximum=10.0, value=0.40, decimals=3, singleStep=0.05)
         self.room_height_in.setToolTip("Desired clearance from tile surface to ceiling (headroom in meters). When importing a 3D model, ceiling height is detected automatically.")
         self.pedestal_min_height_in = QDoubleSpinBox(minimum=0.0, maximum=1.0, value=0.10, decimals=3, singleStep=0.01)
@@ -2884,6 +2945,8 @@ class MainWindow(QMainWindow):
             self.select_surface_btn.show()
             self.clear_selection_btn.show()
             self.surface_info_label.show()
+            # IMPORT MODE ONLY: Set headroom to default 2.0m for import mode
+            self.room_height_in.setValue(2.0)
 
     def export_scene_to_obj(self):
         """Save scene to an OBJ file using the GL widget exporter."""
@@ -2983,10 +3046,8 @@ class MainWindow(QMainWindow):
             # Set import mode flag to prevent default floor rendering
             self.gl_widget.has_imported_model = True
             
-            # Clear existing tiles, pedestals, and default floor mesh so only imported model is visible
-            self.gl_widget.tiles.clear()
-            self.gl_widget.pedestals.clear()
-            self.gl_widget.original_floor_mesh.clear()
+            # IMPORT MODE ONLY: Clear ALL previous/default visualization state
+            self.gl_widget.reset_scene_for_import()
 
             # Auto-position camera to frame the imported model
             self._frame_imported_mesh(mesh)
@@ -3556,6 +3617,9 @@ class MainWindow(QMainWindow):
                 try:
                     hull = ConvexHull(xy_points)
                     boundary_polygon = [(xy_points[i, 0], xy_points[i, 1]) for i in hull.vertices]
+                    
+                    # Store boundary for room boundary drawing in import mode
+                    self.gl_widget.import_room_boundary_poly = boundary_polygon
                     
                     # Update params to use polygon mode
                     params['mode'] = 'polygon'
