@@ -792,7 +792,7 @@ class GLWidget(QOpenGLWidget):
         
         return hit_z
 
-    def compute_layout_on_selected_surfaces(self, tile_params, pedestal_height=0.1016, headroom_m=2.0, min_pedestal_total=0.10):
+    def compute_layout_on_selected_surfaces(self, tile_params, pedestal_height=0.1016, headroom_m=2.0, min_pedestal_total=0.10, room_height_m=0.0):
         """
         Generate tile layout and pedestals ONLY on user-selected surfaces from 3D model.
 
@@ -839,7 +839,6 @@ class GLWidget(QOpenGLWidget):
             print(f"[ROOM-HEIGHT] WARNING: no floor_ref, fallback to mesh ceiling")
         
         # Use user-defined room height to compute ceiling
-        room_height_m = float(self.room_height_spin.value())
         ceiling_z_world = floor_reference_z + room_height_m
         
         print(f"[ROOM-HEIGHT] floor_ref={floor_reference_z:.4f} room_h={room_height_m:.2f} ceiling={ceiling_z_world:.4f}")
@@ -3731,12 +3730,14 @@ class MainWindow(QMainWindow):
             pedestal_height = 0.1016  # Default 4 inches
             headroom_m = params.get('headroom_m', 2.0)
             min_pedestal_total = params.get('min_pedestal_height_m', 0.10)
+            room_height_m = self.room_height_spin.value()
 
             success = self.gl_widget.compute_layout_on_selected_surfaces(
                 tile_params,
                 pedestal_height=pedestal_height,
                 headroom_m=headroom_m,
-                min_pedestal_total=min_pedestal_total
+                min_pedestal_total=min_pedestal_total,
+                room_height_m=room_height_m
             )
 
             if success:
