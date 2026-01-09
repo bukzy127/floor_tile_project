@@ -1082,13 +1082,13 @@ class GLWidget(QOpenGLWidget):
                         qr_data=f"T-{gid}-{iu}-{jv}"
                     )
 
-                    base_z = min(p[2] for p in polygon_3d)
-                    tile_bottom_z = base_z + pedestal_height
+                    # RISING SYSTEM: Use global tile plane Z (from room height + headroom)
+                    # Do NOT calculate from floor - tile plane is fixed
                     tile.corners_bottom_xyz = []
                     tile.corners_top_xyz = []
                     for p in polygon_3d:
                         tile.corners_bottom_xyz.append(QVector3D(p[0], p[1], tile_bottom_z))
-                        tile.corners_top_xyz.append(QVector3D(p[0], p[1], tile_bottom_z + tile_thickness))
+                        tile.corners_top_xyz.append(QVector3D(p[0], p[1], tile_top_z))
                     tile.prepare_pick_geometry()
 
                     all_tiles.append(tile)
@@ -1106,47 +1106,78 @@ class GLWidget(QOpenGLWidget):
                 raw_corners[raw_key]['tiles'].append(t_idx)
         
         # ============================================================
-        # CREATE PEDESTALS: One per unique corner with floor sampling
+        # CREATE PEDESTALS: Nudge XY, sample floor Z, ensure contact
         # ============================================================
+        pedestal_counter = 0
+        
         for raw_key, corner_data in raw_corners.items():
             px_raw, py_raw = corner_data['pos']
+            tile_indices = corner_data['tiles']
             
-            # Sample floor Z at this XY position
-            floor_z = self.get_floor_z_at_xy(px_raw, py_raw, mesh, list(self.selected_surfaces), ceiling_z_world)
+            # Get primary tile for footprint reference
+            primary_tile = all_tiles[tile_indices[0]]
+            footprint_xy = primary_tile.get_actual_xy_footprint()
+            
+            # RISING SYSTEM STEP 4: Nudge pedestal XY inside tile
+            px_ped, py_ped = self.nudge_pedestal_inside_tile((px_raw, py_raw), pedestal_radius, footprint_xy)
+            
+            # Build key from NUDGED XY (fixes clover groups)
+            key = (round(px_ped, 4), round(py_ped, 4))
+            
+            # Skip if already processed
+            if key in all_pedestals:
+                continue
+            
+            # Trace first 20
+            if pedestal_counter < 20:
+                print(f"[PED-XY] raw=({px_raw:.4f},{py_raw:.4f}) nudged=({px_ped:.4f},{py_ped:.4f})")
+            
+            # RISING SYSTEM STEP 3: Sample floor Z at NUDGED XY
+            floor_z = self.get_floor_z_at_xy(px_ped, py_ped, mesh, list(self.selected_surfaces), ceiling_z_world)
+            
             if floor_z is None:
-                floor_z = 0.0  # Fallback
+                # No floor intersection at this XY
+                continue
             
-            # Calculate pedestal height needed
-            total_needed = tile_bottom_z - floor_z
-            total_h = max(total_needed, min_pedestal_total)
+            # RISING SYSTEM STEP 5: Compute pedestal height (top must touch tile bottom)
+            min_ped = min_pedestal_total
+            pedestal_base_z = floor_z
+            pedestal_total_h = tile_bottom_z - pedestal_base_z
             
-            # 2-part pedestal: gray (fixed) + brown (variable)
-            gray_h = min_pedestal_total
-            brown_h = max(0.0, total_h - gray_h)
-            
-            # Validation: check if pedestal can fit
-            if floor_z + total_h > tile_bottom_z + EPSILON:
+            # Validation: Cannot fit minimum pedestal under tile
+            if pedestal_total_h < min_ped - EPSILON:
                 from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.critical(
                     self, "Insufficient Clearance",
-                    f"Pedestal placement failed at ({px_raw:.2f}, {py_raw:.2f}):\n"
+                    f"Pedestal placement failed at ({px_ped:.2f}, {py_ped:.2f}):\n"
                     f"Floor Z: {floor_z:.3f}m\n"
-                    f"Min pedestal: {min_pedestal_total:.3f}m\n"
+                    f"Min pedestal: {min_ped:.3f}m\n"
                     f"Tile plane: {tile_bottom_z:.3f}m\n\n"
                     f"Minimum pedestal height cannot fit under tile plane.\n"
                     f"Try reducing headroom height or increasing min pedestal height."
                 )
                 return False
             
-            if total_h >= 0.01:  # Minimum viable pedestal
-                all_pedestals[raw_key] = {
-                    'pos_xy': (px_raw, py_raw),
-                    'base_z': floor_z,
-                    'height': total_h,
-                    'gray_h': gray_h,
-                    'brown_h': brown_h,
-                    'radius': pedestal_radius
-                }
+            # Split into 2-part pedestal
+            base_h = min_ped
+            riser_h = max(0.0, pedestal_total_h - base_h)
+            
+            # Verify contact (debug)
+            if pedestal_counter < 10:
+                top_z = pedestal_base_z + pedestal_total_h
+                gap = abs(top_z - tile_bottom_z)
+                print(f"[PED-Z] xy=({px_ped:.4f},{py_ped:.4f}) base={pedestal_base_z:.4f} h={pedestal_total_h:.4f} top={top_z:.4f} gap={gap:.6f}")
+            
+            all_pedestals[key] = {
+                'pos_xy': (px_ped, py_ped),
+                'base_z': pedestal_base_z,
+                'height': pedestal_total_h,
+                'gray_h': base_h,
+                'brown_h': riser_h,
+                'radius': pedestal_radius
+            }
+            
+            pedestal_counter += 1
 
         # Store generated tiles and pedestals
         self.tiles = all_tiles
