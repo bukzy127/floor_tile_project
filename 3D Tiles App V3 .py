@@ -2843,15 +2843,14 @@ class MainWindow(QMainWindow):
         tile_f.addRow("Width:",self.tw_in); tile_f.addRow("Length:",self.tl_in); tile_f.addRow("Thickness:",self.tt_in)
         tile_g.setLayout(tile_f); self.control_layout.addWidget(tile_g)
 
-        # 3D Model Properties Group (for surface-based tiling) - hidden until model imported
+        # 3D Model Properties Group (for surface-based tiling)
         self.model_3d_g = QGroupBox("3D Model Properties (meters)")
         model_3d_f = QFormLayout()
-        self.headroom_in = QDoubleSpinBox(minimum=0.1, maximum=10, value=2.0, decimals=2, singleStep=0.1)
+        self.headroom_in = QDoubleSpinBox(minimum=0.0, maximum=10, value=0.0, decimals=2, singleStep=0.1)
         self.min_pedestal_in = QDoubleSpinBox(minimum=0.01, maximum=1, value=0.10, decimals=3, singleStep=0.01)
         model_3d_f.addRow("Headroom (tile top to ceiling):", self.headroom_in)
         model_3d_f.addRow("Min Pedestal Height:", self.min_pedestal_in)
         self.model_3d_g.setLayout(model_3d_f)
-        self.model_3d_g.hide()  # Hidden until 3D model is imported
         self.control_layout.addWidget(self.model_3d_g)
 
         # Material Properties Group
@@ -3145,8 +3144,9 @@ class MainWindow(QMainWindow):
             self.surface_info_label.setText("No surface selected")
             self.surface_info_label.setStyleSheet("color: gray; font-size: 9pt;")
             
-            # Show 3D Model Properties group now that a model is imported
-            self.model_3d_g.show()
+            # Set 3D Model Properties to default values when model is imported
+            self.headroom_in.setValue(2.0)
+            self.min_pedestal_in.setValue(0.1)
 
             # Hide tiles during 3D model viewing
             self.showtiles_cb.setChecked(False)
