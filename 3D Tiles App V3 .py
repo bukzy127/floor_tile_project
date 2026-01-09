@@ -2843,6 +2843,16 @@ class MainWindow(QMainWindow):
         tile_f.addRow("Width:",self.tw_in); tile_f.addRow("Length:",self.tl_in); tile_f.addRow("Thickness:",self.tt_in)
         tile_g.setLayout(tile_f); self.control_layout.addWidget(tile_g)
 
+        # 3D Model Properties Group (for surface-based tiling)
+        model_3d_g = QGroupBox("3D Model Properties (meters)")
+        model_3d_f = QFormLayout()
+        self.headroom_in = QDoubleSpinBox(minimum=0.1, maximum=10, value=2.0, decimals=2, singleStep=0.1)
+        self.min_pedestal_in = QDoubleSpinBox(minimum=0.01, maximum=1, value=0.10, decimals=3, singleStep=0.01)
+        model_3d_f.addRow("Headroom (tile top to ceiling):", self.headroom_in)
+        model_3d_f.addRow("Min Pedestal Height:", self.min_pedestal_in)
+        model_3d_g.setLayout(model_3d_f)
+        self.control_layout.addWidget(model_3d_g)
+
         # Material Properties Group
         material_g = QGroupBox("Material Properties")
         material_f = QFormLayout()
@@ -2900,7 +2910,7 @@ class MainWindow(QMainWindow):
         # Slope/Elevation controls
         slope_g = QGroupBox("Original Subfloor Slope / Elevation")
         slope_f = QFormLayout()
-        self.sbz_in = QDoubleSpinBox(minimum=-10, maximum=10, value=-0.05, decimals=3, singleStep=0.01)
+        self.sbz_in = QDoubleSpinBox(minimum=-10, maximum=10, value=0.0, decimals=3, singleStep=0.01)
         self.sx_in = QDoubleSpinBox(minimum=-0.5, maximum=0.5, value=0.02, decimals=3, singleStep=0.001)
         self.sy_in = QDoubleSpinBox(minimum=-0.5, maximum=0.5, value=0.01, decimals=3, singleStep=0.001)
         slope_f.addRow("Base Z (at origin):", self.sbz_in)
@@ -3643,7 +3653,9 @@ class MainWindow(QMainWindow):
             'elevation_mode': elev_mode,
             'flat_z': self.sbz_in.value() if elev_mode=='flat' else 0.0,
             'tile': {'width':self.tw_in.value(),'length':self.tl_in.value(),'thickness': self.tt_in.value()},
-            'slope': {'base_z':self.sbz_in.value(),'slope_x':self.sx_in.value(),'slope_y': self.sy_in.value()}
+            'slope': {'base_z':self.sbz_in.value(),'slope_x':self.sx_in.value(),'slope_y': self.sy_in.value()},
+            'headroom_m': self.headroom_in.value(),
+            'min_pedestal_height_m': self.min_pedestal_in.value()
         }
         # visualization toggles
         self.gl_widget.show_wireframe = self.wireframe_cb.isChecked()
