@@ -2875,7 +2875,7 @@ class MainWindow(QMainWindow):
         model_3d_f = QFormLayout()
         self.headroom_in = QDoubleSpinBox(minimum=0.0, maximum=10, value=0.0, decimals=2, singleStep=0.1)
         self.min_pedestal_in = QDoubleSpinBox(minimum=0.0, maximum=1, value=0.0, decimals=3, singleStep=0.01)
-        self.room_height_spin = QDoubleSpinBox(minimum=0.50, maximum=10.0, value=0.0, decimals=2, singleStep=0.05)
+        self.room_height_spin = QDoubleSpinBox(minimum=0.0, maximum=10.0, value=0.0, decimals=2, singleStep=0.05)
         model_3d_f.addRow("Headroom (tile top to ceiling):", self.headroom_in)
         model_3d_f.addRow("Min Pedestal Height:", self.min_pedestal_in)
         model_3d_f.addRow("Room height (m):", self.room_height_spin)
