@@ -737,13 +737,70 @@ class GLWidget(QOpenGLWidget):
 
         return (cx, cy)
 
-    def compute_layout_on_selected_surfaces(self, tile_params, pedestal_height=0.1016):
+    @staticmethod
+    def ray_triangle_intersection(ray_origin, ray_direction, v0, v1, v2, epsilon=1e-8):
+        """Möller-Trumbore ray-triangle intersection."""
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        h = np.cross(ray_direction, edge2)
+        a = np.dot(edge1, h)
+        if abs(a) < epsilon:
+            return None
+        f = 1.0 / a
+        s = ray_origin - v0
+        u = f * np.dot(s, h)
+        if u < 0.0 or u > 1.0:
+            return None
+        q = np.cross(s, edge1)
+        v = f * np.dot(ray_direction, q)
+        if v < 0.0 or u + v > 1.0:
+            return None
+        t = f * np.dot(edge2, q)
+        if t < epsilon:
+            return None
+        return ray_origin + ray_direction * t
+
+    def get_floor_z_at_xy(self, x, y, mesh, face_indices, ceiling_z_world):
+        """
+        Query floor Z at world position (x, y) by raycasting downward
+        onto specified triangles from the mesh.
+        """
+        ray_origin = np.array([x, y, ceiling_z_world + 1.0], dtype=np.float64)
+        ray_direction = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        
+        face_array = np.asarray(mesh.faces)
+        vertices = np.asarray(mesh.vertices)
+        
+        min_t = float('inf')
+        hit_z = None
+        
+        for face_idx in face_indices:
+            if face_idx >= len(face_array):
+                continue
+            face = face_array[face_idx]
+            if len(face) < 3:
+                continue
+            v0 = vertices[int(face[0])]
+            v1 = vertices[int(face[1])]
+            v2 = vertices[int(face[2])]
+            hit = self.ray_triangle_intersection(ray_origin, ray_direction, v0, v1, v2)
+            if hit is not None:
+                t = np.linalg.norm(hit - ray_origin)
+                if t < min_t:
+                    min_t = t
+                    hit_z = hit[2]
+        
+        return hit_z
+
+    def compute_layout_on_selected_surfaces(self, tile_params, pedestal_height=0.1016, headroom_m=2.0, min_pedestal_total=0.10):
         """
         Generate tile layout and pedestals ONLY on user-selected surfaces from 3D model.
 
         Args:
             tile_params: Dict with 'width', 'length', 'thickness' in meters
-            pedestal_height: Height of pedestals in meters (default 4 inches = 0.1016m)
+            pedestal_height: Height of pedestals in meters (default 4 inches = 0.1016m) [DEPRECATED - for compatibility]
+            headroom_m: Desired headroom from tile TOP to ceiling (meters) - stored for reference
+            min_pedestal_total: Minimum pedestal height at highest floor point (meters)
 
         Returns:
             bool: True if layout was generated successfully, False otherwise
@@ -756,7 +813,19 @@ class GLWidget(QOpenGLWidget):
             return False
 
         mesh = self.imported_mesh
-
+        tile_thickness = tile_params.get('thickness', 0.02)
+        
+        # ===================================================================
+        # COMPUTE CEILING-BASED TILE PLANE (FIX 1: HEADROOM CONTROLS Z)
+        # ===================================================================
+        ceiling_z_world = float(np.max(np.asarray(mesh.vertices)[:, 2])) if len(mesh.vertices) > 0 else 0.0
+        EPSILON = 1e-8
+        
+        # Use CEILING + HEADROOM to place tile plane (not floor-based)
+        # Headroom is the distance from tile TOP to ceiling
+        tile_top_z = ceiling_z_world - headroom_m
+        tile_bottom_z = tile_top_z - tile_thickness
+        
         # Clear existing tiles and pedestals
         self.tiles.clear()
         self.pedestals.clear()
@@ -764,7 +833,6 @@ class GLWidget(QOpenGLWidget):
 
         tile_width = tile_params.get('width', 0.3048)   # Default 12 inches
         tile_length = tile_params.get('length', 0.3048)  # Default 12 inches
-        tile_thickness = tile_params.get('thickness', 0.02)
         pedestal_radius = 0.035  # Pedestal cap radius
 
         all_tiles = []
@@ -998,15 +1066,61 @@ class GLWidget(QOpenGLWidget):
                     tile.prepare_pick_geometry()
 
                     all_tiles.append(tile)
-                    for px, py, pz in polygon_3d:
-                        key = (round(px, 4), round(py, 4))
-                        if key not in all_pedestals:
-                            all_pedestals[key] = {
-                                'pos_xy': (px, py),
-                                'base_z': pz,
-                                'height': pedestal_height,
-                                'radius': pedestal_radius
-                            }
+
+        # ============================================================
+        # DEDUPLICATE BEFORE NUDGING: Collect all unique raw corners first
+        # ============================================================
+        raw_corners = {}  # key: (round(x,3), round(y,3)) -> {'pos': (x,y), 'tiles': [t_idx,...]}
+        
+        for t_idx, tile in enumerate(all_tiles):
+            for px, py in tile.get_actual_xy_footprint():
+                raw_key = (round(px, 3), round(py, 3))  # 1mm tolerance
+                if raw_key not in raw_corners:
+                    raw_corners[raw_key] = {'pos': (px, py), 'tiles': []}
+                raw_corners[raw_key]['tiles'].append(t_idx)
+        
+        # ============================================================
+        # CREATE PEDESTALS: One per unique corner with floor sampling
+        # ============================================================
+        for raw_key, corner_data in raw_corners.items():
+            px_raw, py_raw = corner_data['pos']
+            
+            # Sample floor Z at this XY position
+            floor_z = self.get_floor_z_at_xy(px_raw, py_raw, mesh, list(self.selected_surfaces), ceiling_z_world)
+            if floor_z is None:
+                floor_z = 0.0  # Fallback
+            
+            # Calculate pedestal height needed
+            total_needed = tile_bottom_z - floor_z
+            total_h = max(total_needed, min_pedestal_total)
+            
+            # 2-part pedestal: gray (fixed) + brown (variable)
+            gray_h = min_pedestal_total
+            brown_h = max(0.0, total_h - gray_h)
+            
+            # Validation: check if pedestal can fit
+            if floor_z + total_h > tile_bottom_z + EPSILON:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(
+                    self, "Insufficient Clearance",
+                    f"Pedestal placement failed at ({px_raw:.2f}, {py_raw:.2f}):\n"
+                    f"Floor Z: {floor_z:.3f}m\n"
+                    f"Min pedestal: {min_pedestal_total:.3f}m\n"
+                    f"Tile plane: {tile_bottom_z:.3f}m\n\n"
+                    f"Minimum pedestal height cannot fit under tile plane.\n"
+                    f"Try reducing headroom height or increasing min pedestal height."
+                )
+                return False
+            
+            if total_h >= 0.01:  # Minimum viable pedestal
+                all_pedestals[raw_key] = {
+                    'pos_xy': (px_raw, py_raw),
+                    'base_z': floor_z,
+                    'height': total_h,
+                    'gray_h': gray_h,
+                    'brown_h': brown_h,
+                    'radius': pedestal_radius
+                }
 
         # Store generated tiles and pedestals
         self.tiles = all_tiles
@@ -1743,42 +1857,66 @@ class GLWidget(QOpenGLWidget):
         return dl
 
     def draw_pedestal(self, pedestal, is_selected=False):
-        if self.unit_cylinder_dl == -1: self.unit_cylinder_dl = self.create_unit_cylinder_dl()
+        if self.unit_cylinder_dl == -1: 
+            self.unit_cylinder_dl = self.create_unit_cylinder_dl()
 
         glPushMatrix()
         glTranslatef(pedestal['pos_xy'][0], pedestal['pos_xy'][1], pedestal['base_z'])
 
-        total_h, cap_r = pedestal['height'], pedestal['radius']
-        BASE_H_F, STEM_H_F, CAP_H_F = 0.10, 0.80, 0.10
-        BASE_R_S, STEM_R_S = 1.0, 0.7
+        # Support both 2-part (gray_h/brown_h) and legacy (height only) formats
+        if 'gray_h' in pedestal and 'brown_h' in pedestal:
+            # 2-part pedestal: dark gray base + light gray extension
+            gray_h = pedestal['gray_h']
+            brown_h = pedestal['brown_h']
+            cap_r = pedestal['radius']
+            
+            # Lower cylinder: dark gray (fixed base)
+            glPushMatrix()
+            glScalef(cap_r * 1.10, cap_r * 1.10, gray_h)
+            glColor3f(0.3, 0.3, 0.3)  # Dark gray
+            glCallList(self.unit_cylinder_dl)
+            glPopMatrix()
+            
+            # Upper cylinder: light gray (variable extension)
+            glPushMatrix()
+            glTranslatef(0, 0, gray_h)
+            glScalef(cap_r, cap_r, brown_h)
+            glColor3f(0.7, 0.7, 0.7)  # Light gray
+            glCallList(self.unit_cylinder_dl)
+            glPopMatrix()
+        else:
+            # Legacy single-part pedestal
+            total_h, cap_r = pedestal['height'], pedestal['radius']
+            BASE_H_F, STEM_H_F, CAP_H_F = 0.10, 0.80, 0.10
+            BASE_R_S, STEM_R_S = 1.0, 0.7
 
-        current_z = 0.0
-        # Draw Base with selection highlight
-        base_h, base_r = total_h * BASE_H_F, cap_r * BASE_R_S
-        glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(base_r, base_r, base_h)
-        if is_selected:
-            glColor3f(1.0, 0.7, 0.0)  # Orange highlight for selected
-        else:
-            glColor3f(0.22, 0.22, 0.25)
-        glCallList(self.unit_cylinder_dl); glPopMatrix()
-        current_z += base_h
-        # Draw Stem
-        stem_h, stem_r = total_h * STEM_H_F, cap_r * STEM_R_S
-        glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(stem_r, stem_r, stem_h)
-        if is_selected:
-            glColor3f(1.0, 0.8, 0.1)  # Lighter orange for stem
-        else:
-            glColor3f(0.28, 0.28, 0.31)
-        glCallList(self.unit_cylinder_dl); glPopMatrix()
-        current_z += stem_h
-        # Draw Cap
-        cap_h = total_h * CAP_H_F
-        glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(cap_r, cap_r, cap_h)
-        if is_selected:
-            glColor3f(1.0, 0.9, 0.2)  # Bright orange/yellow for cap
-        else:
-            glColor3f(0.35, 0.35, 0.38)
-        glCallList(self.unit_cylinder_dl); glPopMatrix()
+            current_z = 0.0
+            # Draw Base with selection highlight
+            base_h, base_r = total_h * BASE_H_F, cap_r * BASE_R_S
+            glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(base_r, base_r, base_h)
+            if is_selected:
+                glColor3f(1.0, 0.7, 0.0)  # Orange highlight for selected
+            else:
+                glColor3f(0.22, 0.22, 0.25)
+            glCallList(self.unit_cylinder_dl); glPopMatrix()
+            current_z += base_h
+            # Draw Stem
+            stem_h, stem_r = total_h * STEM_H_F, cap_r * STEM_R_S
+            glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(stem_r, stem_r, stem_h)
+            if is_selected:
+                glColor3f(1.0, 0.8, 0.1)  # Lighter orange for stem
+            else:
+                glColor3f(0.28, 0.28, 0.31)
+            glCallList(self.unit_cylinder_dl); glPopMatrix()
+            current_z += stem_h
+            # Draw Cap
+            cap_h = total_h * CAP_H_F
+            glPushMatrix(); glTranslatef(0, 0, current_z); glScalef(cap_r, cap_r, cap_h)
+            if is_selected:
+                glColor3f(1.0, 0.9, 0.2)  # Bright orange/yellow for cap
+            else:
+                glColor3f(0.35, 0.35, 0.38)
+            glCallList(self.unit_cylinder_dl); glPopMatrix()
 
         glPopMatrix()
 
@@ -3545,10 +3683,14 @@ class MainWindow(QMainWindow):
             # Generate tiles on selected surfaces only
             tile_params = params['tile']
             pedestal_height = 0.1016  # Default 4 inches
+            headroom_m = params.get('headroom_m', 2.0)
+            min_pedestal_total = params.get('min_pedestal_height_m', 0.10)
 
             success = self.gl_widget.compute_layout_on_selected_surfaces(
                 tile_params,
-                pedestal_height=pedestal_height
+                pedestal_height=pedestal_height,
+                headroom_m=headroom_m,
+                min_pedestal_total=min_pedestal_total
             )
 
             if success:
