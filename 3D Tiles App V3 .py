@@ -816,15 +816,42 @@ class GLWidget(QOpenGLWidget):
         tile_thickness = tile_params.get('thickness', 0.02)
         
         # ===================================================================
-        # COMPUTE CEILING-BASED TILE PLANE (FIX 1: HEADROOM CONTROLS Z)
+        # COMPUTE CEILING-BASED TILE PLANE WITH USER-DEFINED ROOM HEIGHT
         # ===================================================================
-        ceiling_z_world = float(np.max(np.asarray(mesh.vertices)[:, 2])) if len(mesh.vertices) > 0 else 0.0
+        # Determine floor reference Z from selected surfaces
+        floor_reference_z = None
+        if self.selected_surfaces and len(mesh.vertices) > 0:
+            # Get all Z values from vertices of selected faces (floor reference)
+            floor_z_values = []
+            for face_idx in self.selected_surfaces:
+                if face_idx < len(mesh.faces):
+                    face = mesh.faces[face_idx]
+                    for vertex_idx in face:
+                        if vertex_idx < len(mesh.vertices):
+                            floor_z_values.append(float(mesh.vertices[vertex_idx][2]))
+            if floor_z_values:
+                # Use minimum Z as floor reference (lowest point of selected surfaces)
+                floor_reference_z = float(np.min(floor_z_values))
+        
+        # Fallback: use mesh max Z if no floor reference available
+        if floor_reference_z is None:
+            floor_reference_z = float(np.max(np.asarray(mesh.vertices)[:, 2])) if len(mesh.vertices) > 0 else 0.0
+            print(f"[ROOM-HEIGHT] WARNING: no floor_ref, fallback to mesh ceiling")
+        
+        # Use user-defined room height to compute ceiling
+        room_height_m = float(self.room_height_spin.value())
+        ceiling_z_world = floor_reference_z + room_height_m
+        
+        print(f"[ROOM-HEIGHT] floor_ref={floor_reference_z:.4f} room_h={room_height_m:.2f} ceiling={ceiling_z_world:.4f}")
+        
         EPSILON = 1e-8
         
         # Use CEILING + HEADROOM to place tile plane (not floor-based)
         # Headroom is the distance from tile TOP to ceiling
         tile_top_z = ceiling_z_world - headroom_m
         tile_bottom_z = tile_top_z - tile_thickness
+        
+        print(f"[TILE-Z] tile_bottom_z={tile_bottom_z:.4f} tile_top_z={tile_top_z:.4f} headroom_m={headroom_m:.2f}")
         
         # Clear existing tiles and pedestals
         self.tiles.clear()
@@ -2848,8 +2875,10 @@ class MainWindow(QMainWindow):
         model_3d_f = QFormLayout()
         self.headroom_in = QDoubleSpinBox(minimum=0.0, maximum=10, value=0.0, decimals=2, singleStep=0.1)
         self.min_pedestal_in = QDoubleSpinBox(minimum=0.0, maximum=1, value=0.0, decimals=3, singleStep=0.01)
+        self.room_height_spin = QDoubleSpinBox(minimum=0.50, maximum=10.0, value=2.50, decimals=2, singleStep=0.05)
         model_3d_f.addRow("Headroom (tile top to ceiling):", self.headroom_in)
         model_3d_f.addRow("Min Pedestal Height:", self.min_pedestal_in)
+        model_3d_f.addRow("Room height (m):", self.room_height_spin)
         self.model_3d_g.setLayout(model_3d_f)
         self.control_layout.addWidget(self.model_3d_g)
 
